@@ -11,6 +11,7 @@ const { log, err } = require("./src/utils/logger");
 const mongo = require("./src/db/mongo");
 const filesRouter = require("./src/routes/files");
 const actionsRouter = require("./src/routes/actions");
+const templatesRouter = require("./src/routes/templates");
 const { startWs } = require("./src/realtime/wsServer");
 
 const app = express();
@@ -40,6 +41,8 @@ const limiter = rateLimit({
 // mount routers with auth+limiter on /api
 app.use("/api", apiKeyMiddleware, limiter, filesRouter);
 app.use("/api/actions", apiKeyMiddleware, limiter, actionsRouter);
+// mount templates under /api/templates
+app.use("/api/templates", apiKeyMiddleware, limiter, templatesRouter);
 
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "./workspace");
 
