@@ -1,4 +1,3 @@
-// src/routes/actions.js
 const express = require("express");
 const router = express.Router();
 const mongo = require("../db/mongo");
@@ -6,6 +5,8 @@ const { runGit } = require("../tools/git");
 const { createPullRequest } = require("../tools/github");
 const { log, err } = require("../utils/logger");
 const path = require("path");
+const fs = require("fs").promises;
+const { scanTextForSecrets } = require("../utils/security");
 
 const DEFAULT_BASE = process.env.DEFAULT_BRANCH || "main";
 
@@ -27,15 +28,10 @@ router.get("/diff", async (req, res) => {
     const branch = task.branch;
     if (!branch) return res.status(400).json({ success: false, error: "task branch not found; make some edits/commit first" });
 
-    // Ensure we are on the branch
-    try { await runGit(["checkout", branch], workspace); } catch (e) { /* ignore */ }
+    try { await runGit(["checkout", branch], workspace); } catch (e) {}
+    try { await runGit(["fetch", "origin", base], workspace); } catch (e) {}
 
-    // Try to fetch base from origin if possible
-    try { await runGit(["fetch", "origin", base], workspace); } catch (e) { /* ignore */ }
-
-    // Produce diff: base...branch
-    const diffResult = await runGit(["diff", "--no-color", `${base}...${branch}`], workspace).catch(async (e) => {
-      // Fallback: diff HEAD
+    const diffResult = await runGit(["diff", "--no-color", `${base}...${branch}`], workspace).catch(async () => {
       return await runGit(["diff", "--no-color", branch], workspace);
     });
     const diffText = (diffResult && (diffResult.stdout || diffResult.stderr)) || "";
@@ -48,13 +44,93 @@ router.get("/diff", async (req, res) => {
 });
 
 /**
+ * GET /api/actions/file-diff?taskId=&filePath=&base=
+ * Returns baseContent and currentContent for a file (so UI can render side-by-side diff).
+ */
+router.get("/file-diff", async (req, res) => {
+  try {
+    const { taskId, filePath } = req.query;
+    const base = req.query.base || DEFAULT_BASE;
+    if (!taskId || !filePath) return res.status(400).json({ success: false, error: "taskId and filePath required" });
+
+    const task = await mongo.findTaskById(taskId);
+    if (!task) return res.status(404).json({ success: false, error: "task not found" });
+    const workspace = task.workspace;
+    if (!workspace) return res.status(400).json({ success: false, error: "task workspace not set" });
+
+    const branch = task.branch;
+    if (!branch) return res.status(400).json({ success: false, error: "task branch not found; commit changes first" });
+
+    // get base file content via git show base:path (best-effort)
+    let baseContent = "";
+    try {
+      const showRes = await runGit(["show", `${base}:${filePath}`], workspace);
+      baseContent = showRes.stdout || showRes.stderr || "";
+    } catch (e) {
+      // file may not exist on base
+      baseContent = "";
+    }
+
+    // read current file from workspace
+    let currentContent = "";
+    try {
+      const full = path.join(workspace, filePath);
+      currentContent = await fs.readFile(full, "utf8");
+    } catch (e) {
+      currentContent = "";
+    }
+
+    res.json({ success: true, baseContent, currentContent, filePath, branch, base });
+  } catch (e) {
+    err("actions:file-diff error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/**
+ * GET /api/actions/scan?taskId=&base=
+ * Scans the diff for secrets and returns findings.
+ */
+router.get("/scan", async (req, res) => {
+  try {
+    const taskId = req.query.taskId;
+    const base = req.query.base || DEFAULT_BASE;
+    if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+
+    const task = await mongo.findTaskById(taskId);
+    if (!task) return res.status(404).json({ success: false, error: "task not found" });
+    const workspace = task.workspace;
+    if (!workspace) return res.status(400).json({ success: false, error: "task workspace not set" });
+
+    const branch = task.branch;
+    if (!branch) return res.status(400).json({ success: false, error: "task branch not found; commit changes first" });
+
+    // get diff
+    let diff = "";
+    try {
+      const d = await runGit(["diff", "--no-color", `${base}...${branch}`], workspace);
+      diff = d.stdout || d.stderr || "";
+    } catch (e) {
+      diff = "";
+    }
+
+    const findings = scanTextForSecrets(diff);
+    res.json({ success: true, findings, diff, branch, base });
+  } catch (e) {
+    err("actions:scan error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/**
  * POST /api/actions/approve
- * Body: { taskId, title, body, base? }
+ * Body: { taskId, title, body, base?, overrideSecrets:false }
  * Pushes the task branch to origin and creates a PR via Octokit.
+ * Blocks if secret findings exist unless overrideSecrets=true is provided.
  */
 router.post("/approve", async (req, res) => {
   try {
-    const { taskId, title, body: prBody } = req.body || {};
+    const { taskId, title, body: prBody, overrideSecrets } = req.body || {};
     const base = req.body.base || DEFAULT_BASE;
     if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
 
@@ -73,32 +149,39 @@ router.post("/approve", async (req, res) => {
     const repoUrl = meta.repoUrl || null;
 
     if (!owner || !repo) {
-      // try to infer from repoUrl if present: https://github.com/owner/repo.git
       if (repoUrl) {
         const m = repoUrl.match(/github\.com[:\/]([^\/]+)\/(.+?)(\.git)?$/);
-        if (m) {
-          // override owner/repo
-          meta.owner = m[1];
-          meta.repo = m[2];
-        }
+        if (m) { meta.owner = m[1]; meta.repo = m[2]; }
       }
     }
-
     const finalOwner = meta.owner;
     const finalRepo = meta.repo;
     if (!finalOwner || !finalRepo) {
       return res.status(400).json({ success: false, error: "task.meta.owner and task.meta.repo required to push and create PR" });
     }
 
-    // Ensure remote 'origin' is set to an HTTPS URL using GH_PAT (so push works non-interactively)
+    // run secret scan on diff
+    let diff = "";
+    try {
+      const d = await runGit(["diff", "--no-color", `${base}...${branch}`], workspace);
+      diff = d.stdout || d.stderr || "";
+    } catch (e) {
+      diff = "";
+    }
+    const findings = scanTextForSecrets(diff || "");
+    if (findings.length && !overrideSecrets) {
+      return res.status(400).json({ success: false, error: "Secrets detected in diff", findings });
+    }
+
+    // ensure GH token is present
     const ghToken = process.env.GH_PAT;
     if (!ghToken) {
       return res.status(500).json({ success: false, error: "Server GH_PAT not configured; cannot push" });
     }
 
+    // set remote origin to tokenized HTTPS URL (non-persistent)
     const remoteUrl = `https://${encodeURIComponent(ghToken)}@github.com/${finalOwner}/${finalRepo}.git`;
 
-    // Remove any existing origin, then add ours (safe to override for task workspace)
     try {
       await runGit(["remote", "remove", "origin"], workspace).catch(() => {});
       await runGit(["remote", "add", "origin", remoteUrl], workspace);
@@ -106,7 +189,7 @@ router.post("/approve", async (req, res) => {
       log("warning: remote setup error", e.message || e);
     }
 
-    // Push branch
+    // push branch
     try {
       await runGit(["push", "-u", "origin", branch], workspace);
     } catch (e) {
@@ -114,12 +197,11 @@ router.post("/approve", async (req, res) => {
       return res.status(500).json({ success: false, error: "git push failed: " + (e.message || String(e)) });
     }
 
-    // Create PR via Octokit
+    // create PR
     try {
       const prTitle = title || (task.commitMessage || `AI Devin: changes from task ${taskId}`);
       const prBodyFinal = prBody || `This PR was created by AI Devin for task ${taskId}`;
       const pr = await createPullRequest(finalOwner, finalRepo, branch, base, prTitle, prBodyFinal);
-      // update task with PR link and status
       await mongo.updateTask(taskId, { status: "pr_created", finishedAt: new Date(), result: { prUrl: pr.html_url } });
       return res.json({ success: true, prUrl: pr.html_url, pr });
     } catch (e) {
@@ -128,6 +210,52 @@ router.post("/approve", async (req, res) => {
     }
   } catch (e) {
     err("actions:approve error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/**
+ * POST /api/actions/undo
+ * Body: { taskId, base? }
+ * Creates a backup branch, then resets the task branch to base and cleans untracked files.
+ */
+router.post("/undo", async (req, res) => {
+  try {
+    const { taskId } = req.body || {};
+    const base = req.body.base || DEFAULT_BASE;
+    if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+
+    const task = await mongo.findTaskById(taskId);
+    if (!task) return res.status(404).json({ success: false, error: "task not found" });
+    const workspace = task.workspace;
+    if (!workspace) return res.status(400).json({ success: false, error: "task workspace not set" });
+
+    let branch = task.branch;
+    if (!branch) return res.status(400).json({ success: false, error: "task branch not found" });
+
+    // create backup branch name
+    const ts = Date.now();
+    const backupBranch = `backup/${branch.replace(/\//g, "_")}-${ts}`;
+    try {
+      // ensure on branch, create backup
+      await runGit(["checkout", branch], workspace);
+      await runGit(["checkout", "-b", backupBranch], workspace);
+      // return to branch
+      await runGit(["checkout", branch], workspace);
+      // reset branch to base (hard)
+      await runGit(["reset", "--hard", base], workspace);
+      await runGit(["clean", "-fd"], workspace);
+      // update task status
+      await mongo.pushTaskStep(taskId, { name: "undo", timestamp: new Date(), success: true, output: `Reset ${branch} to ${base}, backup: ${backupBranch}` });
+      await mongo.updateTask(taskId, { status: "reverted", lastError: null });
+      return res.json({ success: true, message: `Reverted ${branch} to ${base}`, backupBranch });
+    } catch (e) {
+      err("undo failed", e);
+      await mongo.pushTaskStep(taskId, { name: "undo", timestamp: new Date(), success: false, output: String(e) });
+      return res.status(500).json({ success: false, error: String(e) });
+    }
+  } catch (e) {
+    err("actions:undo error", e);
     res.status(500).json({ success: false, error: e.message || String(e) });
   }
 });
