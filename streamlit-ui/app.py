@@ -5,6 +5,7 @@ import difflib
 import streamlit.components.v1 as components
 import time
 import json
+from math import ceil
 
 # Configurable API base (use Streamlit secrets or default)
 API_BASE = st.secrets.get("api_base", "http://localhost:3000")
@@ -14,7 +15,7 @@ API_ACTIONS = f"{API_BASE}/api/actions"
 API_TEMPLATES = f"{API_BASE}/api/templates"
 
 st.set_page_config(page_title="AI Devin - Control Panel", layout="wide")
-st.title("AI Devin — Control Panel (Templates + File Manager + Diff & Approve)")
+st.title("AI Devin — Control Panel (Auto-Generator + Templates + File Manager + Diff & Approve)")
 
 # Sidebar: API key and WS host
 api_key = st.sidebar.text_input("API key (x-api-key)", value=st.secrets.get("api_key", ""), type="password")
@@ -31,7 +32,7 @@ ws_url = f"{ws_host}/ws"
 components.html(f"""
   <div>
     <div style="font-family: monospace; margin-bottom:6px; color:#444;">WebSocket: <small>{ws_url}</small></div>
-    <div id="log" style="height:220px; overflow:auto; background:#111; color:#ddd; padding:8px; font-family: monospace;"></div>
+    <div id="log" style="height:240px; overflow:auto; background:#111; color:#ddd; padding:8px; font-family: monospace;"></div>
     <script>
       const log = (s)=>{{ const el=document.getElementById('log'); el.innerText = (new Date()).toLocaleTimeString() + ' - ' + s + '\\n' + el.innerText; }};
       try {{
@@ -45,7 +46,7 @@ components.html(f"""
       }}
     </script>
   </div>
-""", height=260)
+""", height=280)
 
 st.markdown("---")
 
@@ -105,12 +106,11 @@ for t in tasks:
     task_options.append(label)
     task_map[label] = tid_str
 
-# Layout: left column = templates & task create & history, right = file manager / editor / diff
+# Layout: left column = templates & task create & auto-generator, right = file manager / editor / progress
 col_left, col_right = st.columns([1, 2])
 
 with col_left:
     st.header("Create Task (Templates)")
-
     tpl_choice = st.selectbox("Choose a template", options=template_options, index=0)
     selected_tpl_id = template_map.get(tpl_choice)
 
@@ -132,8 +132,7 @@ with col_left:
     repoUrl = st.text_input("Repo clone URL (optional)", value=st.session_state["repourl_field"], key="repourl_field")
     autoPR = st.checkbox("Auto-create PR", value=st.session_state["autopr_field"], key="autopr_field")
 
-    load_tpl = st.button("Load template")
-    if load_tpl:
+    if st.button("Load template"):
         if selected_tpl_id:
             r = get(f"{API_TEMPLATES}/{selected_tpl_id}")
             if r.ok:
@@ -168,8 +167,6 @@ with col_left:
             if resp.ok:
                 data = resp.json()
                 st.success(f"Task created: {data.get('taskId')}")
-                # refresh tasks list
-                tasks = fetch_tasks()
                 st.experimental_rerun()
             else:
                 st.error(f"Failed to create task: {resp.text}")
@@ -206,40 +203,74 @@ with col_left:
                 st.error(f"Failed to save template: {rr.text}")
 
     st.markdown("---")
-    st.header("Task History")
-    tasks = fetch_tasks()
-    if tasks:
-        labels = []
-        for t in tasks:
-            tid = t.get("_id")
-            if isinstance(tid, dict) and "$oid" in tid:
-                tid_str = tid["$oid"]
+    st.header("Auto-generate (Module-by-module)")
+    st.markdown("Planner will create a module plan; then modules are generated, committed, and tested one-by-one.")
+
+    # select task for auto-generation
+    auto_task_choice = st.selectbox("Task to auto-generate into", options=task_options, index=0, key="auto_task_choice")
+    auto_task_id = task_map.get(auto_task_choice)
+
+    max_modules = st.number_input("Max modules per run (batch size)", min_value=1, max_value=20, value=3, key="max_modules")
+    chunk_lines = st.number_input("Target lines per module (estimator)", min_value=100, max_value=2000, value=500, key="chunk_lines")
+    token_cost = st.number_input("Token cost USD per 1k (est)", min_value=0.0, value=0.03, step=0.01, key="token_cost")
+
+    st.markdown("### Dry-run / Estimate")
+    if st.button("Plan & estimate (dry-run)", key="plan_estimate"):
+        if not auto_task_id:
+            st.warning("Select a task workspace first.")
+        else:
+            r = post(f"{API_ACTIONS}/start-auto", json_body={"taskId": auto_task_id, "dryRun": True, "maxModulesPerRun": max_modules})
+            if r.ok:
+                data = r.json()
+                plan = data.get("plan", [])
+                estimate = data.get("estimate", {})
+                st.success(f"Planner produced {len(plan)} modules")
+                st.json({ "planSample": plan[:6], "estimate": estimate })
+                total_lines = sum([m.get("targetLines", chunk_lines) for m in plan])
+                approx_chars = total_lines * 40
+                tokens = ceil(approx_chars / 4)
+                cost = (tokens / 1000.0) * token_cost
+                st.write(f"Estimated modules: {len(plan)}, estimated tokens: {tokens}, estimated cost: ${cost:.4f}")
             else:
-                tid_str = str(tid)
-            labels.append(f"{tid_str[:8]} | {t.get('status')} | {t.get('prompt')[:60]}")
-        choice = st.selectbox("Select task", options=list(range(len(tasks))), format_func=lambda i: labels[i])
-        selected_task = tasks[choice]
-        st.markdown(f"**Selected task:** {labels[choice]}")
-        if st.button("Refresh task details"):
-            st.experimental_rerun()
-        # show recent steps
-        task_id_for_view = selected_task.get("_id")
-        if isinstance(task_id_for_view, dict) and "$oid" in task_id_for_view:
-            task_id_for_view = task_id_for_view["$oid"]
-        task_detail = get(f"{API_TASKS}/{task_id_for_view}", timeout=20).json().get("task", {})
-        st.markdown(f"Status: **{task_detail.get('status')}**")
-        st.markdown("### Steps")
-        for s in task_detail.get("steps", []):
-            st.markdown(f"**{s.get('name')}** — {s.get('timestamp')}")
-            st.code(s.get("output") or "(no output)", language="text")
-    else:
-        st.info("No tasks yet. Create one with the form above.")
-        selected_task = None
+                st.error(f"Failed: {r.text}")
+
+    st.markdown("---")
+    st.markdown("### Run controls")
+    col_run, col_stop = st.columns(2)
+    with col_run:
+        if st.button("Start auto-generate (run)", key="start_auto"):
+            if not auto_task_id:
+                st.warning("Select a task workspace first.")
+            else:
+                payload = {
+                    "taskId": auto_task_id,
+                    "dryRun": False,
+                    "maxModulesPerRun": max_modules,
+                    "gitleaksEnabled": True,
+                    "failOnSecrets": True,
+                    "runLint": True,
+                    "failOnLint": False
+                }
+                r = post(f"{API_ACTIONS}/start-auto", json_body=payload, timeout=30)
+                if r.ok:
+                    st.success("Auto-generation started (runs in background); poll status below.")
+                else:
+                    st.error(f"Failed to start: {r.text}")
+    with col_stop:
+        if st.button("Stop auto-generate", key="stop_auto"):
+            if not auto_task_id:
+                st.warning("Select a task workspace first.")
+            else:
+                r = post(f"{API_ACTIONS}/stop-auto", json_body={"taskId": auto_task_id})
+                if r.ok:
+                    st.success("Stop requested")
+                else:
+                    st.error(f"Failed to stop: {r.text}")
 
 with col_right:
-    st.header("File Manager & Editor")
-    # Workspace selector
-    workspace_choice = st.selectbox("Workspace", options=task_options, index=0)
+    st.header("File Manager & Editor / Progress Dashboard")
+    # Workspace selector for file manager
+    workspace_choice = st.selectbox("Workspace", options=task_options, index=0, key="workspace_file_mgr")
     selected_task_id = task_map.get(workspace_choice)
 
     # Directory browsing
@@ -442,3 +473,69 @@ with col_right:
 
     else:
         st.info("Select a file from the left to open it in the editor.")
+
+    st.markdown("---")
+    st.header("Progress Dashboard")
+    inspect_choice = st.selectbox("Inspect task for progress", options=task_options, index=0, key="inspect_task")
+    inspect_task_id = task_map.get(inspect_choice)
+
+    if inspect_task_id:
+        try:
+            r = get(f"{API_TASKS}/{inspect_task_id}", timeout=20)
+            if r.ok:
+                task_detail = r.json().get("task", {})
+            else:
+                st.error("Failed to fetch task details")
+                task_detail = {}
+        except Exception as e:
+            st.error(f"Error: {e}")
+            task_detail = {}
+
+        plan = task_detail.get("modulePlan") or []
+        statuses = task_detail.get("moduleStatuses") or []
+        total = len(plan)
+        succeeded = len([s for s in statuses if s.get("status") == "succeeded"])
+        failed = len([s for s in statuses if s.get("status") == "failed"])
+        pending = len([s for s in statuses if s.get("status") == "pending"])
+        running = len([s for s in statuses if s.get("status") == "running"])
+        st.markdown(f"**Modules**: {total} — succeeded: {succeeded}, running: {running}, failed: {failed}, pending: {pending}")
+        progress = (succeeded / total) * 100 if total else 0
+        st.progress(progress / 100.0)
+
+        st.markdown("### Modules")
+        for idx, m in enumerate(plan):
+            st.markdown(f"**{idx+1}. {m.get('name')}** — {m.get('description','')[:200]}")
+            st.write(f"targetLines: {m.get('targetLines', 'n/a')}, path: {m.get('path','-')}")
+            st.write(f"status: { (statuses[idx]['status'] if idx < len(statuses) else 'unknown') }")
+            if st.button(f"Show diff for module {idx+1}", key=f"diff_mod_{idx}"):
+                try:
+                    r = get(f"{API_ACTIONS}/diff", params={"taskId": inspect_task_id})
+                    if r.ok:
+                        diff = r.json().get("diff","(no diff)")
+                        st.code(diff, language="diff")
+                    else:
+                        st.error("Failed to get diff")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            if st.button(f"Show module log", key=f"log_mod_{idx}"):
+                try:
+                    r2 = get(f"{API_TASKS}/{inspect_task_id}")
+                    if r2.ok:
+                        t = r2.json().get("task", {})
+                        steps = t.get("steps", [])
+                        targetPrefix = f"ci:{m.get('name')}"
+                        found = None
+                        for s in reversed(steps):
+                            if s.get("name","").startswith(targetPrefix):
+                                found = s
+                                break
+                        if found:
+                            st.code(found.get("output","(no output)"), language="text")
+                        else:
+                            st.info("No CI step found yet for module")
+                    else:
+                        st.error("Failed to fetch task steps")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    else:
+        st.info("Select a task to see module plan & progress.")
