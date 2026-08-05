@@ -1,133 +1,145 @@
-# Ai-devin
-AI team — agents that can code, run terminal commands, test and much more
-
 # AI Devin — JS scaffold (Node backend + Streamlit UI)
 
-Status: Prototype / early production-minded scaffold
+Status: Prototype / developer scaffold
 
-AI Devin is a developer-facing multi-agent platform prototype. It runs a small set of agents (planner, coder, docgen, executor, reviewer, github-agent) orchestrated by a worker queue. Tasks are persisted to MongoDB and processed by a BullMQ worker. A minimal Streamlit UI lets you create tasks and inspect task history and step logs.
+AI Devin is an AI-assisted developer platform prototype. It runs a small set of agents (planner, coder, docgen, executor, reviewer, github-agent) orchestrated by a worker queue. Tasks are persisted to MongoDB and processed by a BullMQ worker. A Streamlit UI provides task creation, template management, a file manager/editor, side-by-side diffs, an approval flow (push + PR), undo, and realtime task logs.
 
-This repository is intentionally opinionated but lightweight — it is NOT hardened for running arbitrary untrusted code in production. Treat this as a developer sandbox and follow the security notes below.
+This README explains what’s included, how to run it locally, key APIs, and operational/security notes.
 
 Contents
-- server.js — Express API (task creation, task listing)
+- server.js — Express API (task creation, task listing, templates, file and action endpoints)
 - src/
-  - agents/ — agents: planner, coder, docAgent (documentation/comments), executor, reviewer, githubAgent, etc.
-  - orchestrator/loop.js — pipeline orchestration and task lifecycle
+  - agents/ — agents: planner, coder, docAgent, executor, reviewer, githubAgent, etc.
+  - orchestrator/loop.js — pipeline orchestration, notifications, realtime
   - queue/ — BullMQ queue + worker
-  - db/mongo.js — Mongo helper (tasks collection)
+  - db/mongo.js — Mongo helpers (tasks, templates)
+  - routes/ — files.js, actions.js, templates.js
+  - realtime/wsServer.js — WebSocket broadcaster for live events
   - tools/ — file, git, dockerExec (sandbox runner), terminal, github
-  - utils/ — logger, llm (OpenAI adapter)
-- streamlit-ui/app.py — Python Streamlit app (task creation + history UI)
+  - utils/ — logger, llm (OpenAI adapter), notifier, security scanner
+- streamlit-ui/app.py — Streamlit control UI (templates, file manager, diff, approve, undo, live events)
 - docker/docker-compose.yml — local Redis + Mongo for development
 - .env.example — environment variables to set
-- requirements.txt — Python deps for Streamlit UI
 - package.json — Node dependencies & scripts
+- requirements.txt — Python deps for Streamlit UI
 
-Requirements
-- Node.js >= 18
-- Docker & Docker Compose (for local Redis + Mongo, and for sandboxed execution)
-- Python 3.11+ and pip (for Streamlit UI)
-- (Optional) GitHub CLI `gh` if you want to create a remote repo quickly
+Key capabilities
+- Task persistence in MongoDB and queueing with BullMQ.
+- Per-task ephemeral workspace: WORKSPACE_ROOT/tasks/<taskId> (cloned from repoUrl or git init).
+- Agents: planner, coder (writes code from LLM), docAgent (adds comments/docs), executor (runs tests inside Docker), reviewer (linters), githubAgent.
+- Orchestrator: planner → coder → docgen → executor → reviewer → (optional) githubAgent.
+- File manager + in-browser code editor using Streamlit + streamlit-ace.
+- Git integration: per-task branch ai/task-<shortid>, git add & commit on save.
+- Diff preview: unified and side-by-side per-file diff (difflib).
+- Approval flow: diff scan for secrets, push branch to origin, create PR with Octokit.
+- Undo: revert branch to base and create a backup branch.
+- Secret scanning: regex-based detection; blocks auto-push unless explicitly overridden.
+- Realtime Broadcast: task events emitted over WebSocket (/ws).
+- Notifications: Slack and email (with redaction) for failures.
+- LLM diagnostic: on failing tests, an LLM produces troubleshooting suggestions stored as a step.
+- Task Templates: CRUD API + UI to store and reuse prompt templates.
 
-Environment
-- Copy .env.example to .env and fill values:
-  - OPENAI_API_KEY — required for LLM features (Coder, DocAgent)
-  - GH_PAT — required for GitHub PR creation (githubAgent)
-  - MONGO_URL — MongoDB connection (default: mongodb://localhost:27017/ai_devin)
-  - REDIS_HOST / REDIS_PORT — Redis for BullMQ
-  - WORKSPACE_ROOT — path to the workspace where agents read/write files (default: ./workspace)
-  - DEFAULT_BRANCH — default repo branch (default: main)
+Environment variables (.env)
+Copy .env.example → .env and fill values:
+
+Required for basic operation
+- MONGO_URL=mongodb://localhost:27017/ai_devin
+- REDIS_HOST=127.0.0.1
+- REDIS_PORT=6379
+- WORKSPACE_ROOT=./workspace
+
+Optional but recommended
+- OPENAI_API_KEY=sk-...        (LLM features: coder, docAgent, diagnostics)
+- GH_PAT=ghp_...               (push & PR creation via Octokit)
+- API_KEY=your_api_key         (protect /api endpoints)
+- DEFAULT_BRANCH=main
+
+Notifications (optional)
+- SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+- ADMIN_EMAIL=you@example.com
+- SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE
 
 Quickstart (local)
 1. Install Node deps
    npm install
 
-2. Start local infra (Redis + Mongo)
+2. Start development infra (Redis + Mongo)
    docker-compose -f docker/docker-compose.yml up -d
 
-3. Create .env from .env.example and set OPENAI_API_KEY and GH_PAT (if used).
+3. Configure .env
+   cp .env.example .env
+   # Edit .env and set required vars (MONGO_URL, WORKSPACE_ROOT). Add OPENAI_API_KEY and GH_PAT if using LLM and PR features.
 
-4. Start the API server
+4. Start backend & worker
    npm start
-   - Server default: http://localhost:3000
-
-5. Start the worker in a separate terminal
    npm run worker
 
-6. Start Streamlit UI (optional; Python required)
+5. Install Python deps and start the UI
    pip install -r requirements.txt
+   pip install streamlit-ace
    streamlit run streamlit-ui/app.py
 
-Creating a task (API)
-- Create (persist + enqueue) a task:
-  curl -X POST http://localhost:3000/run \
-    -H "Content-Type: application/json" \
-    -d '{"prompt":"Fix failing tests in module X", "workspace":"./workspace", "autoCreatePR":false, "meta":{"owner":"your-org","repo":"your-repo"}}'
+6. Open the Streamlit UI in your browser (it usually opens automatically). If headless mode is needed:
+   streamlit run streamlit-ui/app.py --server.headless true --server.port 8501
 
-- List tasks:
-  GET http://localhost:3000/tasks
+Using the UI
+- Create Task: fill prompt, owner/repo or repo clone URL (repoUrl), optional template. This creates a task record and a per-task workspace under WORKSPACE_ROOT/tasks/<taskId>.
+- File Manager: browse/edit files in the selected workspace. Saving while a task workspace is selected will create/checkout branch ai/task-<shortid>, git add, and git commit the change.
+- Diff Preview: view unified diffs and side-by-side file diffs between base branch and the task branch.
+- Scan: run secret heuristic scan on diff; if secrets are found, approve/push will be blocked unless override is checked.
+- Approve & Create PR: pushes branch (server uses GH_PAT) and creates a PR via Octokit; PR link returned and stored in task.
+- Undo: reverts the task branch to base, creates a backup branch for safety.
+- Live events: WebSocket log panel shows step broadcasts as agents run.
+- Templates: save/reuse task prompt templates from the Create Task form.
 
-- Get task details:
-  GET http://localhost:3000/tasks/<taskId>
+API endpoints (select)
+- POST /run
+  - Body: { prompt, meta: { owner, repo, repoUrl }, autoCreatePR, ... }
+  - Creates task and enqueues job.
+- GET /tasks
+- GET /tasks/:id
+- File APIs (under /api)
+  - GET /api/files?path=&taskId=
+  - GET /api/file?path=&taskId=
+  - POST /api/file { path, content, taskId, commitMessage }
+  - POST /api/folder { path, taskId }
+  - DELETE /api/file?path=&taskId=
+- Actions (under /api/actions)
+  - GET /api/actions/diff?taskId=&base=
+  - GET /api/actions/file-diff?taskId=&filePath=&base=
+  - GET /api/actions/scan?taskId=&base=
+  - POST /api/actions/approve { taskId, title, body, base?, overrideSecrets? }
+  - POST /api/actions/undo { taskId, base? }
+- Templates (under /api/templates)
+  - GET /api/templates
+  - GET /api/templates/:id
+  - POST /api/templates { name, prompt, meta, defaultFields }
+  - PUT /api/templates/:id
+  - DELETE /api/templates/:id
 
-Streamlit UI
-- UI provides:
-  - Task creation form (prompt, repo owner/name, auto PR toggle)
-  - Task history list (select a task to view step logs and results)
-- By default the UI talks to http://localhost:3000; you can change API_BASE in streamlit secrets or edit the app.
-
-What the pipeline does (current behavior)
-- POST /run stores a task document in Mongo and enqueues a BullMQ job with the taskId.
-- Worker picks up the job and calls orchestrator(taskId).
-- Orchestrator fetches the task and runs pipeline steps in order:
-  1. planner (task decomposition — currently a stub)
-  2. coder (asks LLM to provide file contents; writes to workspace)
-  3. docAgent (asks LLM to add inline comments / docstrings; writes .commented files)
-  4. executor (runs tests/commands in a Docker sandbox)
-  5. reviewer (runs linters like eslint)
-  6. githubAgent (optionally create PR via Octokit if meta.owner & meta.repo provided and autoCreatePR is true)
-- Each step result is appended to the task document's `steps` array in Mongo (append-only). The task `status` is updated (queued → running → completed/failed/needs-review).
-
-Important security notes (read carefully)
-- The sandbox uses Docker CLI with workspace bind-mounts. Do NOT run untrusted code on hosts where Docker daemon has elevated privileges or access to sensitive host files.
-- Limit Docker container caps (cpus/memory) and disable networking for most runs (the executor uses network: false by default).
-- Never commit your OPENAI_API_KEY or GH_PAT. Use environment variables or a secret manager.
-- For production, use isolated runner hosts, container runtimes that enforce stricter sandboxing (gVisor, Kata), and limit filesystem mounts.
-
-Configuration & Operational tips
-- Tune DocAgent.maxFiles to limit LLM call count and cost.
-- Ensure workspace path is isolated per task in production (create ephemeral per-task directories).
-- Use a dedicated Redis and Mongo service (not local Docker on shared host) for production.
-- Add authentication & RBAC on API endpoints before exposing to others.
-
-Development notes / next steps (recommended)
-- Improve coder: parse LLM output as unified diffs and apply with git apply; create branch & commit changes.
-- Persist audit logs for prompts and LLM responses (append-only) for traceability.
-- Add an approval gate in the Streamlit UI to review diffs before auto-creating PRs.
-- Replace naive LLM prompting with structured JSON outputs or tool-assisted patch generation to reduce ambiguity.
-- Add tests (Jest) for agents and orchestrator; include CI workflow.
-
-Installation & run steps
-
-Node server already exposes /api via the router; ensure server.js mounts the router and restart:
-npm install (for Node deps)
-npm start
-Start worker: npm run worker
-Python: install Streamlit + streamlit-ace:
-pip install -r requirements.txt
-Run Streamlit:
-streamlit run streamlit-ui/app.py
-In the File Manager widget, the API base used is http://localhost:3000/api by default — change via streamlit secrets if needed.
-
+Developer notes & best practices
+- Workspace isolation: per-task workspaces are created under WORKSPACE_ROOT/tasks/<taskId>. Clean up old workspaces periodically.
+- Protect the API: set API_KEY in .env and pass it in UI via X-API-KEY header to prevent unauthorized access.
+- GH push: server uses GH_PAT to push. For production, prefer a GitHub App or deploy key with least privileges instead of a user PAT in env vars.
+- Sandbox: the executor runs Docker with workspace bind mounts. Do not run arbitrary untrusted code on hosts where Docker has privileged access. Consider gVisor/Kata for stronger isolation.
+- Secret scanning: the current scanner is regex-based and may have false positives/negatives. For stronger checks, integrate tools like gitleaks.
+- Notifications: notifier redacts detected secret matches in messages, but still be cautious about what gets sent.
 
 Troubleshooting
-- Worker doesn't process jobs: ensure Redis is reachable and `npm run worker` is running.
-- Server can't connect to Mongo: confirm MONGO_URL and that docker-compose mongo is up.
-- LLM errors: ensure OPENAI_API_KEY is set and you have available quota.
+- Worker not processing: ensure Redis is reachable and `npm run worker` is running.
+- Server can't connect to Mongo: verify MONGO_URL and that Mongo container is running.
+- LLM errors: ensure OPENAI_API_KEY is set and you have quota.
+- PR creation fails: ensure GH_PAT is set and task.meta contains owner/repo or repoUrl parsable to owner/repo.
+
+Next recommended improvements
+- Replace GH_PAT push flow with a GitHub App or deploy key for production.
+- Integrate gitleaks for robust secret detection.
+- Add approval audit trail (who approved, timestamp) in Mongo.
+- Add RBAC / authentication for Streamlit UI (SSO/OAuth).
+- Add CI and integration tests for agents and orchestrator.
 
 License
-- MIT — adjust name/year in LICENSE as needed.
+- MIT — adapt as needed.
 
 Acknowledgements
-- Prototype constructed to be a starting point. Modify, harden, and extend to suit your security, scaling, and policy needs.
+- Prototype built to be a starting point; harden and review security before exposing externally.
