@@ -1,8 +1,11 @@
+# streamlit-ui/app.py
 import streamlit as st
 import requests
 from streamlit_ace import st_ace
 import difflib
 import streamlit.components.v1 as components
+import time
+import json
 
 API_BASE = st.secrets.get("api_base", "http://localhost:3000")
 API_FILES = f"{API_BASE}/api"
@@ -10,13 +13,42 @@ API_TASKS = f"{API_BASE}"
 API_ACTIONS = f"{API_BASE}/api/actions"
 
 st.set_page_config(page_title="AI Devin - Control Panel", layout="wide")
-st.title("AI Devin — Control Panel (File Manager + Diff & Approve + Undo)")
+st.title("AI Devin — Control Panel (Live + Diff & Approve + Undo)")
 
 # API key input (for protected server)
 api_key = st.sidebar.text_input("API key (x-api-key)", value=st.secrets.get("api_key", ""), type="password")
 headers = {}
 if api_key:
     headers["X-API-KEY"] = api_key
+
+# Live event panel (WebSocket)
+st.sidebar.markdown("### Live events")
+ws_host = st.sidebar.text_input("WS host (auto)", value="")
+if not ws_host:
+    ws_host = API_BASE.replace("http://", "ws://").replace("https://", "wss://")
+ws_url = f"{ws_host}/ws"
+
+# Embed a small websocket client that displays events
+components.html(f"""
+  <div>
+    <div id="log" style="height:300px; overflow:auto; background:#111; color:#ddd; padding:8px; font-family: monospace;"></div>
+    <script>
+      const log = (s)=>{{ const el=document.getElementById('log'); el.innerText = (new Date()).toLocaleTimeString() + ' - ' + s + '\\n' + el.innerText; }};
+      let socket = null;
+      try {{
+        socket = new WebSocket("{ws_url}");
+        socket.onopen = ()=>log("WS OPEN {ws_url}");
+        socket.onmessage = (evt)=>{{ 
+          try {{ const d = JSON.parse(evt.data); log(JSON.stringify(d)); }} catch(e){{ log(evt.data); }} 
+        }};
+        socket.onclose = ()=>log("WS CLOSED");
+        socket.onerror = (e)=>log("WS ERROR " + JSON.stringify(e));
+      }} catch(e) {{ document.getElementById('log').innerText = 'WS INIT ERROR: ' + e; }}
+    </script>
+  </div>
+""", height=330)
+
+st.markdown("---")
 
 # --- Task creation ---
 with st.expander("Create Task", expanded=False):
