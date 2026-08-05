@@ -1,8 +1,8 @@
-# streamlit-ui/app.py
 import streamlit as st
 import requests
 from streamlit_ace import st_ace
-import time
+import difflib
+import streamlit.components.v1 as components
 
 API_BASE = st.secrets.get("api_base", "http://localhost:3000")
 API_FILES = f"{API_BASE}/api"
@@ -10,9 +10,15 @@ API_TASKS = f"{API_BASE}"
 API_ACTIONS = f"{API_BASE}/api/actions"
 
 st.set_page_config(page_title="AI Devin - Control Panel", layout="wide")
-st.title("AI Devin — Control Panel (File Manager + Diff & Approve)")
+st.title("AI Devin — Control Panel (File Manager + Diff & Approve + Undo)")
 
-# --- Task creation section ---
+# API key input (for protected server)
+api_key = st.sidebar.text_input("API key (x-api-key)", value=st.secrets.get("api_key", ""), type="password")
+headers = {}
+if api_key:
+    headers["X-API-KEY"] = api_key
+
+# --- Task creation ---
 with st.expander("Create Task", expanded=False):
     prompt = st.text_area("Task prompt", "Fix failing tests in module X")
     owner = st.text_input("Repo owner (for PR)", "")
@@ -23,7 +29,7 @@ with st.expander("Create Task", expanded=False):
     if submit:
         payload = {"prompt": prompt, "workspace": "./workspace", "autoCreatePR": autoPR, "meta": {"owner": owner, "repo": repo, "repoUrl": repoUrl}}
         try:
-            resp = requests.post(f"{API_TASKS}/run", json=payload, timeout=60)
+            resp = requests.post(f"{API_TASKS}/run", json=payload, timeout=60, headers=headers)
             if resp.ok:
                 data = resp.json()
                 st.success(f"Task created: {data.get('taskId')}")
@@ -41,7 +47,7 @@ col1, col2 = st.columns([1, 3])
 # fetch tasks
 def fetch_tasks():
     try:
-        r = requests.get(f"{API_TASKS}/tasks", timeout=20)
+        r = requests.get(f"{API_TASKS}/tasks", timeout=20, headers=headers)
         if r.ok:
             return r.json().get("tasks", [])
     except Exception:
@@ -70,7 +76,7 @@ with col1:
             params = {"path": path}
             if taskId:
                 params["taskId"] = taskId
-            r = requests.get(f"{API_FILES}/files", params=params, timeout=20)
+            r = requests.get(f"{API_FILES}/files", params=params, timeout=20, headers=headers)
             if r.ok:
                 data = r.json()
                 return data.get("list", []), data.get("workspace"), data.get("taskId")
@@ -106,7 +112,7 @@ with col1:
         if new_file_name:
             target = f"{(current_dir.rstrip('/') + '/' + new_file_name).lstrip('/')}"
             payload = {"path": target, "content": "", "taskId": selected_task_id}
-            r = requests.post(f"{API_FILES}/file", json=payload)
+            r = requests.post(f"{API_FILES}/file", json=payload, headers=headers)
             if r.ok:
                 st.success("File created")
                 st.experimental_rerun()
@@ -116,7 +122,7 @@ with col1:
     new_folder_name = st.text_input("New folder name (relative)", value="", key="new_folder")
     if st.button("Create folder"):
         target = f"{(current_dir.rstrip('/') + '/' + new_folder_name).lstrip('/')}"
-        r = requests.post(f"{API_FILES}/folder", json={"path": target, "taskId": selected_task_id})
+        r = requests.post(f"{API_FILES}/folder", json={"path": target, "taskId": selected_task_id}, headers=headers)
         if r.ok:
             st.success("Folder created")
             st.experimental_rerun()
@@ -126,7 +132,7 @@ with col1:
     if file_choice:
         if st.button("Delete selected file"):
             target = (current_dir.rstrip('/') + "/" + file_choice).lstrip('/')
-            r = requests.delete(f"{API_FILES}/file", params={"path": target, "taskId": selected_task_id})
+            r = requests.delete(f"{API_FILES}/file", params={"path": target, "taskId": selected_task_id}, headers=headers)
             if r.ok:
                 st.success("Deleted")
                 st.experimental_rerun()
@@ -134,7 +140,7 @@ with col1:
                 st.error(f"Delete failed: {r.text}")
 
 with col2:
-    st.subheader("Editor & Diff / Approve")
+    st.subheader("Editor & Diff / Approve / Undo")
     selected_file = None
     if "current_dir" in st.session_state:
         current_dir = st.session_state["current_dir"]
@@ -148,7 +154,7 @@ with col2:
         if selected_task_id:
             params["taskId"] = selected_task_id
         try:
-            r = requests.get(f"{API_FILES}/file", params=params, timeout=20)
+            r = requests.get(f"{API_FILES}/file", params=params, timeout=20, headers=headers)
             if r.ok:
                 content = r.json().get("content", "")
             else:
@@ -159,53 +165,105 @@ with col2:
             st.error(f"Error reading file: {e}")
 
         mode = "python" if selected_file.endswith(".py") else "javascript"
-        editor_content = st_ace(value=content, language=mode, theme="monokai", key="ace_editor", height=420)
+        editor_content = st_ace(value=content, language=mode, theme="monokai", key="ace_editor", height=300)
         if st.button("Save file"):
             payload = {"path": selected_file, "content": editor_content, "taskId": selected_task_id, "commitMessage": f"Edit {selected_file}"}
-            r = requests.post(f"{API_FILES}/file", json=payload, timeout=20)
+            r = requests.post(f"{API_FILES}/file", json=payload, timeout=20, headers=headers)
             if r.ok:
                 st.success("Saved")
             else:
                 st.error(f"Save failed: {r.text}")
 
         st.markdown("---")
-        st.markdown("### Diff preview for Task workspace (if branch exists)")
-        if selected_task_id:
-            if st.button("Preview diff"):
+        st.markdown("### Side-by-side file diff (base vs current)")
+        base_branch = st.text_input("Base branch for diff", value=st.secrets.get("default_branch", "main"))
+        if st.button("Show file diff (side-by-side)"):
+            if not selected_task_id:
+                st.warning("Select a task workspace to show file diff.")
+            else:
                 try:
-                    diff_resp = requests.get(f"{API_ACTIONS}/diff", params={"taskId": selected_task_id}, timeout=30)
-                    if diff_resp.ok:
-                        diff_data = diff_resp.json()
-                        st.code(diff_data.get("diff", "(empty diff)"), language="diff")
+                    r = requests.get(f"{API_ACTIONS}/file-diff", params={"taskId": selected_task_id, "filePath": selected_file, "base": base_branch}, timeout=30, headers=headers)
+                    if r.ok:
+                        data = r.json()
+                        baseContent = data.get("baseContent", "")
+                        currentContent = data.get("currentContent", "")
+                        hd = difflib.HtmlDiff(tabsize=4, wrapcolumn=80)
+                        table = hd.make_table(baseContent.splitlines(), currentContent.splitlines(),
+                                              fromdesc=f"{base_branch}:{selected_file}", todesc=f"workspace:{selected_file}", context=True, numlines=3)
+                        components.html(table, height=600, scrolling=True)
                     else:
-                        st.error(f"Failed to get diff: {diff_resp.text}")
+                        st.error(f"Failed to get file diff: {r.text}")
                 except Exception as e:
-                    st.error(f"Error fetching diff: {e}")
-            st.markdown("#### Approve & Create PR")
-            pr_title = st.text_input("PR Title", value=f"AI: changes for task {selected_task_id}")
-            pr_body = st.text_area("PR Body", value=f"Automated PR created by AI Devin for task {selected_task_id}")
-            if st.button("Approve & Create PR"):
-                confirm = st.checkbox("I confirm I reviewed the diff and want to push & create a PR", value=False)
-                if not confirm:
-                    st.warning("Please confirm the approval checkbox before proceeding.")
-                else:
-                    payload = {"taskId": selected_task_id, "title": pr_title, "body": pr_body}
-                    try:
-                        appr = requests.post(f"{API_ACTIONS}/approve", json=payload, timeout=60)
-                        if appr.ok:
-                            data = appr.json()
-                            pr_url = data.get("prUrl")
-                            if pr_url:
-                                st.success(f"PR created: {pr_url}")
-                                st.write(pr_url)
-                            else:
-                                st.success("Push & PR flow completed")
-                                st.json(data)
+                    st.error(f"Error fetching file diff: {e}")
+
+        st.markdown("### Scan diff for secrets")
+        if st.button("Scan workspace diff for secrets"):
+            if not selected_task_id:
+                st.warning("Select a task workspace to scan.")
+            else:
+                try:
+                    r = requests.get(f"{API_ACTIONS}/scan", params={"taskId": selected_task_id, "base": base_branch}, timeout=30, headers=headers)
+                    if r.ok:
+                        data = r.json()
+                        findings = data.get("findings", [])
+                        if findings:
+                            st.error("Secrets detected! Review findings below and do NOT approve until fixed.")
+                            for f in findings:
+                                st.write(f"Type: {f['type']}")
+                                st.write(f"Matches: {f['matches']}")
                         else:
-                            st.error(f"Approve failed: {appr.text}")
-                    except Exception as e:
-                        st.error(f"Error during approve: {e}")
-        else:
-            st.info("Select a task workspace to preview diffs and create PRs.")
+                            st.success("No obvious secrets detected in the diff.")
+                    else:
+                        st.error(f"Scan failed: {r.text}")
+                except Exception as e:
+                    st.error(f"Error scanning: {e}")
+
+        st.markdown("---")
+        st.markdown("### Approve & Create PR (blocked if secrets found unless override)")
+        pr_title = st.text_input("PR Title", value=f"AI: changes for task {selected_task_id}")
+        pr_body = st.text_area("PR Body", value=f"Automated PR created by AI Devin for task {selected_task_id}")
+        override_allowed = st.checkbox("Override secret-blocking (I understand the risks)", value=False)
+        if st.button("Approve & Create PR"):
+            if not selected_task_id:
+                st.warning("Select a task workspace to approve.")
+            else:
+                payload = {"taskId": selected_task_id, "title": pr_title, "body": pr_body, "overrideSecrets": bool(override_allowed)}
+                try:
+                    r = requests.post(f"{API_ACTIONS}/approve", json=payload, timeout=60, headers=headers)
+                    if r.ok:
+                        j = r.json()
+                        pr_url = j.get("prUrl")
+                        if pr_url:
+                            st.success(f"PR created: {pr_url}")
+                            st.write(pr_url)
+                        else:
+                            st.success("Approve flow completed")
+                            st.json(j)
+                    else:
+                        st.error(f"Approve failed: {r.text}")
+                        try:
+                            st.json(r.json())
+                        except:
+                            pass
+                except Exception as e:
+                    st.error(f"Error during approve: {e}")
+
+        st.markdown("---")
+        st.markdown("### Undo / Revert task workspace branch")
+        if st.button("Undo / Revert branch to base"):
+            if not selected_task_id:
+                st.warning("Select a task workspace to revert.")
+            else:
+                try:
+                    payload = {"taskId": selected_task_id, "base": base_branch}
+                    r = requests.post(f"{API_ACTIONS}/undo", json=payload, timeout=60, headers=headers)
+                    if r.ok:
+                        st.success("Undo completed")
+                        st.json(r.json())
+                    else:
+                        st.error(f"Undo failed: {r.text}")
+                except Exception as e:
+                    st.error(f"Error during undo: {e}")
+
     else:
         st.info("Select a file from the left to open it in the editor.")
