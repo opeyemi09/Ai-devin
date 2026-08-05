@@ -26,6 +26,10 @@ function templatesCollection() {
   return getDb().collection("templates");
 }
 
+function auditsCollection() {
+  return getDb().collection("audits");
+}
+
 async function insertTask(task) {
   const col = tasksCollection();
   const now = new Date();
@@ -96,12 +100,8 @@ async function deleteTemplate(id) {
   return res.deletedCount === 1;
 }
 
-/* Module plan helpers (new) */
+/* Module plan helpers (existing) */
 
-/**
- * setModulePlan(taskId, plan)
- * plan: array of { name, path, description, targetLines, tests: { path or pattern }, extras... }
- */
 async function setModulePlan(taskId, plan) {
   const col = tasksCollection();
   const _id = typeof taskId === "string" ? new ObjectId(taskId) : taskId;
@@ -124,6 +124,26 @@ async function updateModuleStatus(taskId, moduleIndex, update) {
   return res.value;
 }
 
+/* Audit collection helpers (new) */
+
+async function insertAudit(audit) {
+  // audit: { taskId, type, action, actor, details, timestamp }
+  const col = auditsCollection();
+  const now = new Date();
+  const doc = Object.assign({ timestamp: now }, audit);
+  // normalize taskId to ObjectId if present and looks like string
+  if (doc.taskId && typeof doc.taskId === "string") {
+    try { doc.taskId = new ObjectId(doc.taskId); } catch (_) { /* leave as-is */ }
+  }
+  const res = await col.insertOne(doc);
+  return res.insertedId;
+}
+
+async function findAudits(filter = {}, limit = 200) {
+  const col = auditsCollection();
+  return col.find(filter).sort({ timestamp: -1 }).limit(limit).toArray();
+}
+
 module.exports = {
   connect,
   getDb,
@@ -140,5 +160,7 @@ module.exports = {
   setModulePlan,
   getModulePlan,
   updateModuleStatus,
+  insertAudit,
+  findAudits,
   ObjectId
 };
