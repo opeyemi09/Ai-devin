@@ -1,20 +1,31 @@
 require("dotenv").config();
-const filesRouter = require("./src/routes/files");
 const express = require("express");
 const bodyParser = require("body-parser");
+const fs = require("fs").promises;
+const path = require("path");
 const { taskQueue } = require("./src/queue/queue");
 const { log, err } = require("./src/utils/logger");
 const mongo = require("./src/db/mongo");
+const filesRouter = require("./src/routes/files");
 
 const app = express();
 app.use(bodyParser.json());
+
+// mount file manager endpoints
 app.use("/api", filesRouter);
 
-
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/ai_devin";
+const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "./workspace");
+
+async function ensureDir(p) {
+  await fs.mkdir(p, { recursive: true }).catch(() => {});
+}
 
 async function start() {
   await mongo.connect(MONGO_URL);
+
+  // ensure workspace root exists
+  await ensureDir(WORKSPACE_ROOT);
 
   app.get("/health", (req, res) => res.json({ status: "ok" }));
 
@@ -26,17 +37,46 @@ async function start() {
       const taskDoc = {
         prompt: body.prompt || "",
         createdBy: body.createdBy || "local",
-        workspace: body.workspace || process.env.WORKSPACE_ROOT || "./workspace",
+        // placeholder workspace; will be updated after task row created
+        workspace: null,
         autoCreatePR: !!body.autoCreatePR,
         meta: body.meta || {},
-        branch: body.branch || null,
+        branch: null,
         commitMessage: body.commitMessage || null,
         status: "queued"
       };
       const insertedId = await mongo.insertTask(taskDoc);
-      await taskQueue.add("task", { taskId: insertedId.toString() });
-      log("Created task", insertedId.toString());
-      res.json({ success: true, taskId: insertedId.toString() });
+      const taskId = insertedId.toString();
+
+      // create per-task workspace directory: WORKSPACE_ROOT/tasks/<taskId>
+      const taskWorkspace = path.join(WORKSPACE_ROOT, "tasks", taskId);
+      await ensureDir(taskWorkspace);
+
+      // If a repo URL was provided, try to git clone into the workspace; otherwise init git
+      const repoUrl = (body.meta && body.meta.repoUrl) || body.repoUrl || null;
+      const { runGit } = require("./src/tools/git");
+      try {
+        if (repoUrl) {
+          // clone into the workspace path
+          await runGit(["clone", repoUrl, taskWorkspace], process.cwd());
+          log("Cloned repo into", taskWorkspace);
+        } else {
+          // initialize empty git repo
+          await runGit(["init"], taskWorkspace);
+          log("Initialized empty git repo in", taskWorkspace);
+        }
+      } catch (e) {
+        log("Git setup failed, initializing empty repo instead", e.message || e);
+        try { await runGit(["init"], taskWorkspace); } catch (e2) { log("git init also failed", e2.message || e2); }
+      }
+
+      // update task doc with workspace path
+      await mongo.updateTask(taskId, { workspace: taskWorkspace });
+
+      // enqueue a job referring to the taskId
+      await taskQueue.add("task", { taskId });
+      log("Created task", taskId, "workspace", taskWorkspace);
+      res.json({ success: true, taskId });
     } catch (e) {
       err("Failed to create task", e);
       res.status(500).json({ success: false, error: e.message });
