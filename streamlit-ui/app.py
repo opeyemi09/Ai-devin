@@ -1,15 +1,18 @@
+# streamlit-ui/app.py
 import streamlit as st
 import requests
 from streamlit_ace import st_ace
+import time
 
 API_BASE = st.secrets.get("api_base", "http://localhost:3000")
 API_FILES = f"{API_BASE}/api"
 API_TASKS = f"{API_BASE}"
+API_ACTIONS = f"{API_BASE}/api/actions"
 
 st.set_page_config(page_title="AI Devin - Control Panel", layout="wide")
-st.title("AI Devin — Control Panel (File Manager + Code Editor)")
+st.title("AI Devin — Control Panel (File Manager + Diff & Approve)")
 
-# --- Task creation section (unchanged) ---
+# --- Task creation section ---
 with st.expander("Create Task", expanded=False):
     prompt = st.text_area("Task prompt", "Fix failing tests in module X")
     owner = st.text_input("Repo owner (for PR)", "")
@@ -31,11 +34,11 @@ with st.expander("Create Task", expanded=False):
 
 st.markdown("---")
 
-# --- File Manager / Editor with workspace selection ---
-st.header("File Manager & Code Editor")
+# --- Workspace + File Manager ---
+st.header("Workspace / File Manager / Editor")
 col1, col2 = st.columns([1, 3])
 
-# fetch tasks for workspace selection
+# fetch tasks
 def fetch_tasks():
     try:
         r = requests.get(f"{API_TASKS}/tasks", timeout=20)
@@ -47,7 +50,7 @@ def fetch_tasks():
 
 tasks = fetch_tasks()
 task_options = ["Workspace root (global)"]
-task_map = { "Workspace root (global)": None }
+task_map = {"Workspace root (global)": None}
 for t in tasks:
     tid = t["_id"]["$oid"] if "_id" in t and "$oid" in t["_id"] else str(t.get("_id"))
     label = f"{tid[:8]} | {t.get('status')} | {t.get('prompt')[:50]}"
@@ -62,7 +65,6 @@ with col1:
     st.markdown("### Browse")
     current_dir = st.text_input("Directory (relative to workspace)", value="", key="current_dir")
 
-    # list files in selected workspace
     def list_files(path="", taskId=None):
         try:
             params = {"path": path}
@@ -132,7 +134,7 @@ with col1:
                 st.error(f"Delete failed: {r.text}")
 
 with col2:
-    st.subheader("Editor")
+    st.subheader("Editor & Diff / Approve")
     selected_file = None
     if "current_dir" in st.session_state:
         current_dir = st.session_state["current_dir"]
@@ -142,11 +144,10 @@ with col2:
     if 'file_choice' in locals() and file_choice:
         selected_file = (current_dir.rstrip('/') + "/" + file_choice).lstrip('/')
     if selected_file:
-        # read file via API with optional taskId
+        params = {"path": selected_file}
+        if selected_task_id:
+            params["taskId"] = selected_task_id
         try:
-            params = {"path": selected_file}
-            if selected_task_id:
-                params["taskId"] = selected_task_id
             r = requests.get(f"{API_FILES}/file", params=params, timeout=20)
             if r.ok:
                 content = r.json().get("content", "")
@@ -158,7 +159,7 @@ with col2:
             st.error(f"Error reading file: {e}")
 
         mode = "python" if selected_file.endswith(".py") else "javascript"
-        editor_content = st_ace(value=content, language=mode, theme="monokai", key="ace_editor", height=600)
+        editor_content = st_ace(value=content, language=mode, theme="monokai", key="ace_editor", height=420)
         if st.button("Save file"):
             payload = {"path": selected_file, "content": editor_content, "taskId": selected_task_id, "commitMessage": f"Edit {selected_file}"}
             r = requests.post(f"{API_FILES}/file", json=payload, timeout=20)
@@ -166,5 +167,45 @@ with col2:
                 st.success("Saved")
             else:
                 st.error(f"Save failed: {r.text}")
+
+        st.markdown("---")
+        st.markdown("### Diff preview for Task workspace (if branch exists)")
+        if selected_task_id:
+            if st.button("Preview diff"):
+                try:
+                    diff_resp = requests.get(f"{API_ACTIONS}/diff", params={"taskId": selected_task_id}, timeout=30)
+                    if diff_resp.ok:
+                        diff_data = diff_resp.json()
+                        st.code(diff_data.get("diff", "(empty diff)"), language="diff")
+                    else:
+                        st.error(f"Failed to get diff: {diff_resp.text}")
+                except Exception as e:
+                    st.error(f"Error fetching diff: {e}")
+            st.markdown("#### Approve & Create PR")
+            pr_title = st.text_input("PR Title", value=f"AI: changes for task {selected_task_id}")
+            pr_body = st.text_area("PR Body", value=f"Automated PR created by AI Devin for task {selected_task_id}")
+            if st.button("Approve & Create PR"):
+                confirm = st.checkbox("I confirm I reviewed the diff and want to push & create a PR", value=False)
+                if not confirm:
+                    st.warning("Please confirm the approval checkbox before proceeding.")
+                else:
+                    payload = {"taskId": selected_task_id, "title": pr_title, "body": pr_body}
+                    try:
+                        appr = requests.post(f"{API_ACTIONS}/approve", json=payload, timeout=60)
+                        if appr.ok:
+                            data = appr.json()
+                            pr_url = data.get("prUrl")
+                            if pr_url:
+                                st.success(f"PR created: {pr_url}")
+                                st.write(pr_url)
+                            else:
+                                st.success("Push & PR flow completed")
+                                st.json(data)
+                        else:
+                            st.error(f"Approve failed: {appr.text}")
+                    except Exception as e:
+                        st.error(f"Error during approve: {e}")
+        else:
+            st.info("Select a task workspace to preview diffs and create PRs.")
     else:
         st.info("Select a file from the left to open it in the editor.")
