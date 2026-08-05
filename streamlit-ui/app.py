@@ -125,6 +125,8 @@ with col_left:
         st.session_state["repourl_field"] = ""
     if "autopr_field" not in st.session_state:
         st.session_state["autopr_field"] = False
+    if "invoker_field" not in st.session_state:
+        st.session_state["invoker_field"] = ""
 
     prompt = st.text_area("Task prompt", value=st.session_state["prompt_field"], key="prompt_field", height=120)
     owner = st.text_input("Repo owner (for PR)", value=st.session_state["owner_field"], key="owner_field")
@@ -249,7 +251,8 @@ with col_left:
                     "gitleaksEnabled": True,
                     "failOnSecrets": True,
                     "runLint": True,
-                    "failOnLint": False
+                    "failOnLint": False,
+                    "invokedBy": st.session_state.get("invoker_field", "") or "ui"
                 }
                 r = post(f"{API_ACTIONS}/start-auto", json_body=payload, timeout=30)
                 if r.ok:
@@ -261,7 +264,7 @@ with col_left:
             if not auto_task_id:
                 st.warning("Select a task workspace first.")
             else:
-                r = post(f"{API_ACTIONS}/stop-auto", json_body={"taskId": auto_task_id})
+                r = post(f"{API_ACTIONS}/stop-auto", json_body={"taskId": auto_task_id, "invokedBy": st.session_state.get("invoker_field", "") or "ui"})
                 if r.ok:
                     st.success("Stop requested")
                 else:
@@ -271,12 +274,12 @@ with col_left:
     st.markdown("### Resume failed or specific modules")
     st.write("Provide comma-separated module indices (0-based) to retry specific modules, or leave empty to resume from first failed/pending module.")
     resume_indices_input = st.text_input("Module indices (e.g. 2,5,7)", value="", key="resume_indices")
-    invoker = st.text_input("Invoker name (optional, recorded in audit)", value="", key="invoker_field")
+    invoker = st.text_input("Invoker name (optional, recorded in audit)", value=st.session_state.get("invoker_field", ""), key="invoker_field")
     if st.button("Resume modules", key="resume_btn"):
         if not auto_task_id:
             st.warning("Select a task workspace first.")
         else:
-            payload = {"taskId": auto_task_id, "maxModulesPerRun": max_modules, "gitleaksEnabled": True, "runLint": True, "failOnSecrets": True}
+            payload = {"taskId": auto_task_id, "maxModulesPerRun": max_modules, "gitleaksEnabled": True, "runLint": True, "failOnSecrets": True, "invokedBy": invoker or "ui"}
             if resume_indices_input.strip():
                 try:
                     idxs = [int(x.strip()) for x in resume_indices_input.split(",") if x.strip() != ""]
@@ -284,8 +287,6 @@ with col_left:
                 except Exception:
                     st.error("Invalid indices format. Use comma-separated integers.")
                     idxs = None
-            if invoker.strip():
-                payload["invokedBy"] = invoker.strip()
             r = post(f"{API_ACTIONS}/resume-auto", json_body=payload, timeout=30)
             if r.ok:
                 st.success("Resume request submitted; background processing will run.")
@@ -532,35 +533,60 @@ with col_right:
             st.markdown(f"**{idx+1}. {m.get('name')}** — {m.get('description','')[:200]}")
             st.write(f"targetLines: {m.get('targetLines', 'n/a')}, path: {m.get('path','-')}")
             st.write(f"status: { (statuses[idx]['status'] if idx < len(statuses) else 'unknown') }")
-            if st.button(f"Show diff for module {idx+1}", key=f"diff_mod_{idx}"):
-                try:
-                    r = get(f"{API_ACTIONS}/diff", params={"taskId": inspect_task_id})
-                    if r.ok:
-                        diff = r.json().get("diff","(no diff)")
-                        st.code(diff, language="diff")
-                    else:
-                        st.error("Failed to get diff")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-            if st.button(f"Show module log", key=f"log_mod_{idx}"):
-                try:
-                    r2 = get(f"{API_TASKS}/{inspect_task_id}")
-                    if r2.ok:
-                        t = r2.json().get("task", {})
-                        steps = t.get("steps", [])
-                        targetPrefix = f"ci:{m.get('name')}"
-                        found = None
-                        for s in reversed(steps):
-                            if s.get("name","").startswith(targetPrefix):
-                                found = s
-                                break
-                        if found:
-                            st.code(found.get("output","(no output)"), language="text")
+            col_a, col_b, col_c = st.columns([1,1,1])
+            with col_a:
+                if st.button(f"Show diff for module {idx+1}", key=f"diff_mod_{idx}"):
+                    try:
+                        r = get(f"{API_ACTIONS}/diff", params={"taskId": inspect_task_id})
+                        if r.ok:
+                            diff = r.json().get("diff","(no diff)")
+                            st.code(diff, language="diff")
                         else:
-                            st.info("No CI step found yet for module")
-                    else:
-                        st.error("Failed to fetch task steps")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                            st.error("Failed to get diff")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            with col_b:
+                if st.button(f"Show module log", key=f"log_mod_{idx}"):
+                    try:
+                        r2 = get(f"{API_TASKS}/{inspect_task_id}")
+                        if r2.ok:
+                            t = r2.json().get("task", {})
+                            steps = t.get("steps", [])
+                            targetPrefix = f"ci:{m.get('name')}"
+                            found = None
+                            for s in reversed(steps):
+                                if s.get("name","").startswith(targetPrefix):
+                                    found = s
+                                    break
+                            if found:
+                                st.code(found.get("output","(no output)"), language="text")
+                            else:
+                                st.info("No CI step found yet for module")
+                        else:
+                            st.error("Failed to fetch task steps")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            with col_c:
+                # Resume this module button: calls resume-auto for the single module index
+                if st.button(f"Resume this module", key=f"resume_mod_{idx}"):
+                    invoker_val = st.session_state.get("invoker_field", "") or "ui"
+                    payload = {
+                        "taskId": inspect_task_id,
+                        "moduleIndices": [idx],
+                        "maxModulesPerRun": 1,
+                        "gitleaksEnabled": True,
+                        "runLint": True,
+                        "failOnSecrets": True,
+                        "invokedBy": invoker_val
+                    }
+                    try:
+                        r = post(f"{API_ACTIONS}/resume-auto", json_body=payload, timeout=30)
+                        if r.ok:
+                            st.success(f"Resume requested for module {idx}")
+                            st.json(r.json())
+                        else:
+                            st.error(f"Failed to request resume: {r.text}")
+                    except Exception as e:
+                        st.error(f"Error requesting resume: {e}")
     else:
         st.info("Select a task to see module plan & progress.")
