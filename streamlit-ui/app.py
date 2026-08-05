@@ -267,6 +267,32 @@ with col_left:
                 else:
                     st.error(f"Failed to stop: {r.text}")
 
+    st.markdown("---")
+    st.markdown("### Resume failed or specific modules")
+    st.write("Provide comma-separated module indices (0-based) to retry specific modules, or leave empty to resume from first failed/pending module.")
+    resume_indices_input = st.text_input("Module indices (e.g. 2,5,7)", value="", key="resume_indices")
+    invoker = st.text_input("Invoker name (optional, recorded in audit)", value="", key="invoker_field")
+    if st.button("Resume modules", key="resume_btn"):
+        if not auto_task_id:
+            st.warning("Select a task workspace first.")
+        else:
+            payload = {"taskId": auto_task_id, "maxModulesPerRun": max_modules, "gitleaksEnabled": True, "runLint": True, "failOnSecrets": True}
+            if resume_indices_input.strip():
+                try:
+                    idxs = [int(x.strip()) for x in resume_indices_input.split(",") if x.strip() != ""]
+                    payload["moduleIndices"] = idxs
+                except Exception:
+                    st.error("Invalid indices format. Use comma-separated integers.")
+                    idxs = None
+            if invoker.strip():
+                payload["invokedBy"] = invoker.strip()
+            r = post(f"{API_ACTIONS}/resume-auto", json_body=payload, timeout=30)
+            if r.ok:
+                st.success("Resume request submitted; background processing will run.")
+                st.json(r.json())
+            else:
+                st.error(f"Failed to resume: {r.text}")
+
 with col_right:
     st.header("File Manager & Editor / Progress Dashboard")
     # Workspace selector for file manager
@@ -411,12 +437,11 @@ with col_right:
                     r = get(f"{API_ACTIONS}/scan", params={"taskId": selected_task_id, "base": base_branch}, timeout=30)
                     if r.ok:
                         data = r.json()
-                        findings = data.get("findings", [])
+                        findings = data.get("gitleaksFindings", []) or []
                         if findings:
                             st.error("Secrets detected! Review findings below and do NOT approve until fixed.")
                             for f in findings:
-                                st.write(f"Type: {f['type']}")
-                                st.write(f"Matches: {f['matches']}")
+                                st.write(f)
                         else:
                             st.success("No obvious secrets detected in the diff.")
                     else:
