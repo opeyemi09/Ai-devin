@@ -22,6 +22,10 @@ function tasksCollection() {
   return getDb().collection("tasks");
 }
 
+function templatesCollection() {
+  return getDb().collection("templates");
+}
+
 async function insertTask(task) {
   const col = tasksCollection();
   const now = new Date();
@@ -56,4 +60,54 @@ async function pushTaskStep(id, step) {
   return res.value;
 }
 
-module.exports = { connect, getDb, insertTask, findTasks, findTaskById, updateTask, pushTaskStep, ObjectId };
+/* Template helpers */
+
+async function insertTemplate(template) {
+  const col = templatesCollection();
+  const now = new Date();
+  const doc = Object.assign({ createdAt: now, updatedAt: now }, template);
+  const res = await col.insertOne(doc);
+  return res.insertedId;
+}
+
+async function findTemplates(filter = {}, limit = 100) {
+  const col = templatesCollection();
+  return col.find(filter).sort({ updatedAt: -1 }).limit(limit).toArray();
+}
+
+async function findTemplateById(id) {
+  const col = templatesCollection();
+  const _id = typeof id === "string" ? new ObjectId(id) : id;
+  return col.findOne({ _id });
+}
+
+async function updateTemplate(id, update) {
+  const col = templatesCollection();
+  const _id = typeof id === "string" ? new ObjectId(id) : id;
+  update.updatedAt = new Date();
+  const res = await col.findOneAndUpdate({ _id }, { $set: update }, { returnDocument: "after" });
+  return res.value;
+}
+
+async function deleteTemplate(id) {
+  const col = templatesCollection();
+  const _id = typeof id === "string" ? new ObjectId(id) : id;
+  const res = await col.deleteOne({ _id });
+  return res.deletedCount === 1;
+}
+
+module.exports = {
+  connect,
+  getDb,
+  insertTask,
+  findTasks,
+  findTaskById,
+  updateTask,
+  pushTaskStep,
+  insertTemplate,
+  findTemplates,
+  findTemplateById,
+  updateTemplate,
+  deleteTemplate,
+  ObjectId
+};
