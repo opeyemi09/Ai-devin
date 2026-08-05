@@ -1,9 +1,15 @@
+// src/agents/executor.js
 const { runInDocker } = require("../tools/dockerExec");
 const { log } = require("../utils/logger");
 
-/**
- * ExecutorAgent runs test commands inside a sandboxed container pointing to workspace.
- */
+// Basic test-summary helper (naive)
+function summarizeTestOutput(stdout, stderr) {
+  const combined = `${stdout}\n${stderr}`;
+  const failed = (combined.match(/fail(ed|ure)|error|FAILED|Traceback/gi) || []).length;
+  const passed = (combined.match(/pass(ed)?|OK\b/gi) || []).length;
+  return { passed, failed, excerpt: combined.slice(0, 2000) };
+}
+
 class ExecutorAgent {
   async run(task = {}) {
     const workspace = task.workspace || process.env.WORKSPACE_ROOT || "./workspace";
@@ -11,10 +17,16 @@ class ExecutorAgent {
     const cmd = task.testCommand || "npm test || true";
     try {
       const res = await runInDocker(image, workspace, cmd, { timeoutSeconds: 120, cpus: "0.5", memory: "512m", network: false });
-      return { success: res.code === 0, output: res.stdout + "\n" + res.stderr, metadata: { code: res.code } };
+      const stdout = res.stdout || "";
+      const stderr = res.stderr || "";
+      const summary = summarizeTestOutput(stdout, stderr);
+      return {
+        success: res.code === 0,
+        output: `exit=${res.code}\n\nstdout:\n${stdout}\n\nstderr:\n${stderr}`,
+        metadata: { exitCode: res.code, summary }
+      };
     } catch (e) {
-      log("Executor error", e);
-      return { success: false, output: String(e) };
+      return { success: false, output: String(e), metadata: { error: true } };
     }
   }
 }
