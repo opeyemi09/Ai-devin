@@ -1,145 +1,165 @@
-# AI Devin — JS scaffold (Node backend + Streamlit UI)
+# AI Devin — End-to-End AI-assisted Developer Platform
 
 Status: Prototype / developer scaffold
 
-AI Devin is an AI-assisted developer platform prototype. It runs a small set of agents (planner, coder, docgen, executor, reviewer, github-agent) orchestrated by a worker queue. Tasks are persisted to MongoDB and processed by a BullMQ worker. A Streamlit UI provides task creation, template management, a file manager/editor, side-by-side diffs, an approval flow (push + PR), undo, and realtime task logs.
+This repository is an AI-assisted development scaffold that can generate, test, review, and prepare code changes (commits and PRs) using an orchestrated set of agents and a web UI. It supports automated, chunked project generation (module-by-module), per-module CI in Docker, secret & quality gates (gitleaks, lint/tests), token/cost estimation, and a Streamlit-based dashboard for progress and approvals.
 
-This README explains what’s included, how to run it locally, key APIs, and operational/security notes.
+This README summarizes what’s included, how to run it, and how to use the new automated generation features.
 
 Contents
-- server.js — Express API (task creation, task listing, templates, file and action endpoints)
+- server.js — Express API and WebSocket server
 - src/
-  - agents/ — agents: planner, coder, docAgent, executor, reviewer, githubAgent, etc.
-  - orchestrator/loop.js — pipeline orchestration, notifications, realtime
+  - agents/ — planner, coder, docAgent, executor, reviewer, githubAgent
+  - orchestrator/
+    - loop.js — original orchestrator
+    - autoGenerator.js — automated chunked-generation orchestrator
+    - moduleRunner.js — generate/write/commit + module CI runner
   - queue/ — BullMQ queue + worker
-  - db/mongo.js — Mongo helpers (tasks, templates)
-  - routes/ — files.js, actions.js, templates.js
-  - realtime/wsServer.js — WebSocket broadcaster for live events
-  - tools/ — file, git, dockerExec (sandbox runner), terminal, github
-  - utils/ — logger, llm (OpenAI adapter), notifier, security scanner
-- streamlit-ui/app.py — Streamlit control UI (templates, file manager, diff, approve, undo, live events)
-- docker/docker-compose.yml — local Redis + Mongo for development
-- .env.example — environment variables to set
-- package.json — Node dependencies & scripts
-- requirements.txt — Python deps for Streamlit UI
+  - db/mongo.js — Mongo helpers for tasks, templates, module plans/statuses
+  - routes/ — files.js, actions.js (updated), templates.js
+  - realtime/wsServer.js — WebSocket broadcaster
+  - tools/ — git, dockerExec, gitleaks integration, github helpers
+  - utils/ — logger, llm adapter, notifier, security scanner
+- streamlit-ui/app.py — Streamlit control UI (templates, file manager, diff, approve, undo, auto-generate dashboard)
+- docker/docker-compose.yml — local Redis + Mongo
+- .env.example — environment variables with new entries
+- package.json, requirements.txt
 
-Key capabilities
-- Task persistence in MongoDB and queueing with BullMQ.
-- Per-task ephemeral workspace: WORKSPACE_ROOT/tasks/<taskId> (cloned from repoUrl or git init).
-- Agents: planner, coder (writes code from LLM), docAgent (adds comments/docs), executor (runs tests inside Docker), reviewer (linters), githubAgent.
-- Orchestrator: planner → coder → docgen → executor → reviewer → (optional) githubAgent.
-- File manager + in-browser code editor using Streamlit + streamlit-ace.
-- Git integration: per-task branch ai/task-<shortid>, git add & commit on save.
-- Diff preview: unified and side-by-side per-file diff (difflib).
-- Approval flow: diff scan for secrets, push branch to origin, create PR with Octokit.
-- Undo: revert branch to base and create a backup branch.
-- Secret scanning: regex-based detection; blocks auto-push unless explicitly overridden.
-- Realtime Broadcast: task events emitted over WebSocket (/ws).
+Highlights / Capabilities
+- Task persistence in MongoDB and processing via BullMQ worker.
+- Per-task workspaces: WORKSPACE_ROOT/tasks/<taskId> (clone repo or init).
+- Modular agent pipeline: planner → coder → docgen → executor → reviewer → (optional) githubAgent.
+- Automated chunked-generation:
+  - Planner creates a module plan (list of modules/files with target LOC).
+  - autoGenerator iterates modules and invokes moduleRunner.
+  - moduleRunner calls coder, writes files, commits, runs module-level CI in Docker, runs linters, runs gitleaks (optional), and records status.
+- Module-level CI runs inside Docker (configurable image), storing logs in workspace/artifacts/.
+- Secret scanning via gitleaks (Docker image). Findings block pushes unless explicitly overridden.
+- Streamlit UI:
+  - Create/load/save task templates.
+  - File manager & editor with auto-commit on save to ai/task-<id> branch.
+  - Unified and side-by-side diffs.
+  - Scan diff for secrets and approve/push + create PR.
+  - Undo/revert branch (creates backup).
+  - Auto-generate panel (dry-run, start/stop, controls).
+  - Progress dashboard: module statuses, progress bar, per-module logs.
+- Token & cost estimator (simple heuristic) for planned generation.
+- WebSocket realtime events broadcast to UI (/ws).
 - Notifications: Slack and email (with redaction) for failures.
-- LLM diagnostic: on failing tests, an LLM produces troubleshooting suggestions stored as a step.
-- Task Templates: CRUD API + UI to store and reuse prompt templates.
 
-Environment variables (.env)
-Copy .env.example → .env and fill values:
+Quickstart (local development)
+1. Copy .env.example -> .env and set values:
+   - MONGO_URL (e.g., mongodb://localhost:27017/ai_devin)
+   - REDIS_HOST / REDIS_PORT
+   - WORKSPACE_ROOT=./workspace
+   - OPTIONAL: OPENAI_API_KEY (LLM), GH_PAT (for push/PR), API_KEY (protect /api)
+   - OPTIONAL: SLACK_WEBHOOK_URL, ADMIN_EMAIL, SMTP_* for notifications
+   - OPTIONAL: GITLEAKS_IMAGE (default: zricethezav/gitleaks:8.12.0)
+   - OPTIONAL: TOKEN_COST_USD_PER_1K (default: 0.03)
 
-Required for basic operation
-- MONGO_URL=mongodb://localhost:27017/ai_devin
-- REDIS_HOST=127.0.0.1
-- REDIS_PORT=6379
-- WORKSPACE_ROOT=./workspace
-
-Optional but recommended
-- OPENAI_API_KEY=sk-...        (LLM features: coder, docAgent, diagnostics)
-- GH_PAT=ghp_...               (push & PR creation via Octokit)
-- API_KEY=your_api_key         (protect /api endpoints)
-- DEFAULT_BRANCH=main
-
-Notifications (optional)
-- SLACK_WEBHOOK_URL=https://hooks.slack.com/...
-- ADMIN_EMAIL=you@example.com
-- SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE
-
-Quickstart (local)
-1. Install Node deps
-   npm install
-
-2. Start development infra (Redis + Mongo)
+2. Start infra:
    docker-compose -f docker/docker-compose.yml up -d
 
-3. Configure .env
-   cp .env.example .env
-   # Edit .env and set required vars (MONGO_URL, WORKSPACE_ROOT). Add OPENAI_API_KEY and GH_PAT if using LLM and PR features.
-
-4. Start backend & worker
+3. Install Node dependencies and start backend & worker:
+   npm install
    npm start
    npm run worker
 
-5. Install Python deps and start the UI
+4. Install Python deps and start UI:
    pip install -r requirements.txt
    pip install streamlit-ace
    streamlit run streamlit-ui/app.py
 
-6. Open the Streamlit UI in your browser (it usually opens automatically). If headless mode is needed:
-   streamlit run streamlit-ui/app.py --server.headless true --server.port 8501
+5. Open your browser to the Streamlit UI (defaults to http://localhost:8501).
 
-Using the UI
-- Create Task: fill prompt, owner/repo or repo clone URL (repoUrl), optional template. This creates a task record and a per-task workspace under WORKSPACE_ROOT/tasks/<taskId>.
-- File Manager: browse/edit files in the selected workspace. Saving while a task workspace is selected will create/checkout branch ai/task-<shortid>, git add, and git commit the change.
-- Diff Preview: view unified diffs and side-by-side file diffs between base branch and the task branch.
-- Scan: run secret heuristic scan on diff; if secrets are found, approve/push will be blocked unless override is checked.
-- Approve & Create PR: pushes branch (server uses GH_PAT) and creates a PR via Octokit; PR link returned and stored in task.
-- Undo: reverts the task branch to base, creates a backup branch for safety.
-- Live events: WebSocket log panel shows step broadcasts as agents run.
-- Templates: save/reuse task prompt templates from the Create Task form.
+Key environment variables (.env.example additions)
+- GITLEAKS_IMAGE=zricethezav/gitleaks:8.12.0
+- TOKEN_COST_USD_PER_1K=0.03
+- API_KEY=... (protect /api)
+- GH_PAT=... (used server-side to push & create PRs)
+- OPENAI_API_KEY=... (LLM)
 
-API endpoints (select)
+Main API endpoints (selected)
 - POST /run
   - Body: { prompt, meta: { owner, repo, repoUrl }, autoCreatePR, ... }
-  - Creates task and enqueues job.
-- GET /tasks
-- GET /tasks/:id
-- File APIs (under /api)
+  - Creates a task and enqueues it.
+
+- File manager (/api)
   - GET /api/files?path=&taskId=
   - GET /api/file?path=&taskId=
   - POST /api/file { path, content, taskId, commitMessage }
   - POST /api/folder { path, taskId }
   - DELETE /api/file?path=&taskId=
-- Actions (under /api/actions)
+
+- Actions (/api/actions)
   - GET /api/actions/diff?taskId=&base=
   - GET /api/actions/file-diff?taskId=&filePath=&base=
-  - GET /api/actions/scan?taskId=&base=
+  - GET /api/actions/scan?taskId=&base= (runs gitleaks when available)
   - POST /api/actions/approve { taskId, title, body, base?, overrideSecrets? }
   - POST /api/actions/undo { taskId, base? }
-- Templates (under /api/templates)
-  - GET /api/templates
-  - GET /api/templates/:id
-  - POST /api/templates { name, prompt, meta, defaultFields }
-  - PUT /api/templates/:id
-  - DELETE /api/templates/:id
 
-Developer notes & best practices
-- Workspace isolation: per-task workspaces are created under WORKSPACE_ROOT/tasks/<taskId>. Clean up old workspaces periodically.
-- Protect the API: set API_KEY in .env and pass it in UI via X-API-KEY header to prevent unauthorized access.
-- GH push: server uses GH_PAT to push. For production, prefer a GitHub App or deploy key with least privileges instead of a user PAT in env vars.
-- Sandbox: the executor runs Docker with workspace bind mounts. Do not run arbitrary untrusted code on hosts where Docker has privileged access. Consider gVisor/Kata for stronger isolation.
-- Secret scanning: the current scanner is regex-based and may have false positives/negatives. For stronger checks, integrate tools like gitleaks.
-- Notifications: notifier redacts detected secret matches in messages, but still be cautious about what gets sent.
+- Automated generation (new)
+  - POST /api/actions/start-auto
+    - Body (examples): { taskId, dryRun?: true, maxModulesPerRun?: 3, testCommand?, sandboxImage?, gitleaksEnabled?: true, failOnSecrets?: true, runLint?: true }
+    - dryRun=true returns planner-produced module plan + token/cost estimate without running generation.
+    - dryRun=false starts background processing (up to maxModulesPerRun per invocation).
+  - POST /api/actions/stop-auto { taskId }
+  - GET /api/actions/auto-status?taskId=...
 
-Troubleshooting
-- Worker not processing: ensure Redis is reachable and `npm run worker` is running.
-- Server can't connect to Mongo: verify MONGO_URL and that Mongo container is running.
-- LLM errors: ensure OPENAI_API_KEY is set and you have quota.
-- PR creation fails: ensure GH_PAT is set and task.meta contains owner/repo or repoUrl parsable to owner/repo.
+Data model additions
+- Each task document may include:
+  - modulePlan: array of module specs (name, path, description, targetLines, tests, etc.)
+  - moduleStatuses: array of { name, status: pending|running|succeeded|failed|dry, updatedAt, info }
+  - steps: append-only array of agent/CI steps and outputs
 
-Next recommended improvements
-- Replace GH_PAT push flow with a GitHub App or deploy key for production.
-- Integrate gitleaks for robust secret detection.
-- Add approval audit trail (who approved, timestamp) in Mongo.
-- Add RBAC / authentication for Streamlit UI (SSO/OAuth).
-- Add CI and integration tests for agents and orchestrator.
+How the automated generator works (summary)
+1. Planner produces a module plan (list of modules and target lines).
+2. The plan is stored in the task (modulePlan) and moduleStatuses are initialized.
+3. start-auto (dryRun) returns plan & estimate; start-auto (run) stores the plan and begins processing modules.
+4. moduleRunner for each module:
+   - Calls Coder to generate files for the module spec (coder.run(taskWithModuleSpec)).
+   - Writes files into workspace/tasks/<taskId>/...
+   - Git add & commit on the task branch.
+   - Runs module-level CI in Docker (testCommand), writes artifacts to workspace/artifacts/.
+   - Optionally runs lint (npm run lint) and gitleaks.
+   - Updates moduleStatuses to reflect success/failure and pushes steps to the task.
+
+Safety & quality gates
+- Gitleaks runs (Docker image) and findings block PR push unless overrideSecrets is used (Approve endpoint supports override).
+- Lint/test failures mark a module as failed and pause the auto-generator. You can fix and resume.
+- The system is conservative by default: auto-push is disabled; you must approve PR creation or use explicit autoCreatePR with caution.
+
+Streamlit UI highlights
+- Create Task: use templates or freeform prompt.
+- Auto-generate panel: plan & estimate (dry-run), start/stop auto-generation, configure batch size and gates.
+- Progress dashboard: module-by-module status, progress bar, per-module logs and diffs.
+- File manager/editor: edit files, commit automatically to ai/task-<id> branch for task workspaces.
+- Diff preview and side-by-side per-file diffs.
+- Scan+Approve: run gitleaks and approve to push & create PR (GH_PAT required on server).
+- Undo endpoint: creates backup branch then resets to base if you need to revert.
+
+Operational notes & requirements
+- Docker is required on the host for module-level CI and gitleaks.
+- Protect your server: set API_KEY in .env and do not expose without authentication.
+- Keep GH_PAT & OPENAI_API_KEY in secure storage and do not commit them.
+- For production, prefer GitHub App/deploy-key instead of GH_PAT and stronger sandboxing (gVisor, Kata) for running untrusted code.
+
+Limitations & recommendations
+- The token & cost estimator is heuristic. For accurate billing, instrument your llm adapter to return token usage per call.
+- Gitleaks regex/heuristics and the notifier redaction reduce risk but are not a substitute for careful auditing.
+- Generated code must be reviewed — LLMs can hallucinate or produce insecure code. Use small, testable chunks.
+- Consider adding an approval audit trail (who approved, when) and RBAC/SSO for the UI.
+
+Next steps you can ask for
+- Integrate precise token accounting in the LLM wrapper.
+- Replace PAT push flow with a GitHub App.
+- Add audit trail for approvals in Mongo.
+- Harden sandboxing and run tests in isolated CI/CD runners.
+- Add unit/integration tests for orchestrator and moduleRunner.
+
+Contact / contribution
+- This scaffold is intended as a starting point. Please review and harden before exposing externally.
+- If you want, I can push these changes to a repo branch for you (provide repo and permissions), or create example tasks to test the automated flow on a small sample project.
 
 License
-- MIT — adapt as needed.
-
-Acknowledgements
-- Prototype built to be a starting point; harden and review security before exposing externally.
+- MIT (adapt as needed).
