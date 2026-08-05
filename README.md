@@ -108,6 +108,19 @@ Development notes / next steps (recommended)
 - Replace naive LLM prompting with structured JSON outputs or tool-assisted patch generation to reduce ambiguity.
 - Add tests (Jest) for agents and orchestrator; include CI workflow.
 
+Installation & run steps
+
+Node server already exposes /api via the router; ensure server.js mounts the router and restart:
+npm install (for Node deps)
+npm start
+Start worker: npm run worker
+Python: install Streamlit + streamlit-ace:
+pip install -r requirements.txt
+Run Streamlit:
+streamlit run streamlit-ui/app.py
+In the File Manager widget, the API base used is http://localhost:3000/api by default — change via streamlit secrets if needed.
+
+
 Troubleshooting
 - Worker doesn't process jobs: ensure Redis is reachable and `npm run worker` is running.
 - Server can't connect to Mongo: confirm MONGO_URL and that docker-compose mongo is up.
