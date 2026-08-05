@@ -1,0 +1,39 @@
+ai-devin-system/
+├── .env.example
+├── .gitignore
+├── Dockerfile (docker/Dockerfile)
+├── docker/
+│   └── docker-compose.yml
+├── package.json
+├── README.md
+├── requirements.txt
+├── server.js
+├── src/
+│   ├── db/
+│   │   └── mongo.js
+│   ├── orchestrator/
+│   │   └── loop.js
+│   ├── queue/
+│   │   ├── queue.js
+│   │   └── worker.js
+│   ├── agents/
+│   │   ├── planner.js
+│   │   ├── coder.js
+│   │   ├── executor.js
+│   │   ├── reviewer.js
+│   │   ├── decomposer.js
+│   │   ├── reflection.js
+│   │   ├── memoryAgent.js
+│   │   ├── githubAgent.js
+│   │   └── docAgent.js
+│   ├── tools/
+│   │   ├── file.js
+│   │   ├── git.js
+│   │   ├── dockerExec.js
+│   │   ├── terminal.js
+│   │   └── github.js
+│   └── utils/
+│       ├── logger.js
+│       └── llm.js
+└── streamlit-ui/
+    └── app.py
