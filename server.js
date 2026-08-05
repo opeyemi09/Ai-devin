@@ -1,3 +1,4 @@
+// server.js
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -7,12 +8,15 @@ const { taskQueue } = require("./src/queue/queue");
 const { log, err } = require("./src/utils/logger");
 const mongo = require("./src/db/mongo");
 const filesRouter = require("./src/routes/files");
+const actionsRouter = require("./src/routes/actions");
 
 const app = express();
 app.use(bodyParser.json());
 
-// mount file manager endpoints
+// mount file manager endpoints under /api
 app.use("/api", filesRouter);
+// mount actions endpoints under /api/actions
+app.use("/api/actions", actionsRouter);
 
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/ai_devin";
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "./workspace");
@@ -37,7 +41,6 @@ async function start() {
       const taskDoc = {
         prompt: body.prompt || "",
         createdBy: body.createdBy || "local",
-        // placeholder workspace; will be updated after task row created
         workspace: null,
         autoCreatePR: !!body.autoCreatePR,
         meta: body.meta || {},
