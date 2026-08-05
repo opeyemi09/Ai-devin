@@ -1,20 +1,18 @@
-const fs = require("fs").promises;
-const path = require("path");
+const { exec } = require("child_process");
 const { log } = require("../utils/logger");
 
-async function ensureDir(p) {
-  await fs.mkdir(p, { recursive: true }).catch(() => {});
+function runGit(args, cwd) {
+  return new Promise((resolve, reject) => {
+    const cmd = `git ${args.join(" ")}`;
+    exec(cmd, { cwd }, (err, stdout, stderr) => {
+      if (err) {
+        log("git err:", stderr || err.message);
+        return reject(err);
+      }
+      if (stderr) log("git stderr:", stderr);
+      resolve({ stdout, stderr });
+    });
+  });
 }
 
-async function write(filePath, content) {
-  const dir = path.dirname(filePath);
-  await ensureDir(dir);
-  await fs.writeFile(filePath, content, "utf8");
-  log("Wrote file", filePath);
-}
-
-async function read(filePath) {
-  return fs.readFile(filePath, "utf8");
-}
-
-module.exports = { write, read, ensureDir };
+module.exports = { runGit };
