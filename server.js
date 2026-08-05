@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const http = require("http");
 const bodyParser = require("body-parser");
 const fs = require("fs").promises;
 const path = require("path");
@@ -10,6 +11,7 @@ const { log, err } = require("./src/utils/logger");
 const mongo = require("./src/db/mongo");
 const filesRouter = require("./src/routes/files");
 const actionsRouter = require("./src/routes/actions");
+const { startWs } = require("./src/realtime/wsServer");
 
 const app = express();
 app.use(helmet());
@@ -21,7 +23,6 @@ function apiKeyMiddleware(req, res, next) {
   if (!API_KEY) return next(); // if not set, do not enforce
   const key = req.headers["x-api-key"] || req.query.api_key || req.headers["authorization"];
   if (!key) return res.status(401).json({ success: false, error: "API key required" });
-  // accept "Bearer <key>" or raw key
   const normalized = (key || "").toString().replace(/^Bearer\s+/i, "");
   if (normalized !== API_KEY) return res.status(403).json({ success: false, error: "invalid API key" });
   next();
@@ -29,19 +30,17 @@ function apiKeyMiddleware(req, res, next) {
 
 // global rate limiter for API routes
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200, // limit each IP to 200 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: "Too many requests, slow down" }
 });
 
-// apply auth + limiter to /api
+// mount routers with auth+limiter on /api
 app.use("/api", apiKeyMiddleware, limiter, filesRouter);
-// apply auth + limiter to actions explicitly
 app.use("/api/actions", apiKeyMiddleware, limiter, actionsRouter);
 
-// non-API endpoints still available (e.g., /run, /tasks)
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "./workspace");
 
 async function ensureDir(p) {
@@ -130,8 +129,11 @@ async function start() {
     }
   });
 
+  // start HTTP server and attach WS on same port
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => log(`Server listening on ${PORT}`));
+  const httpServer = http.createServer(app);
+  startWs(httpServer);
+  httpServer.listen(PORT, () => log(`Server listening on ${PORT}`));
 }
 
 start().catch((e) => {
