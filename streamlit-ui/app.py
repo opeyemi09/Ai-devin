@@ -74,7 +74,6 @@ template_options = ["(none)"]
 template_map = {"(none)": None}
 for t in templates:
     tid = t.get("_id")
-    # handle ObjectId serialization
     if isinstance(tid, dict) and "$oid" in tid:
         tid_str = tid["$oid"]
     else:
@@ -83,7 +82,7 @@ for t in templates:
     template_options.append(label)
     template_map[label] = tid_str
 
-# Tasks fetch
+# Tasks fetch & mapping
 def fetch_tasks():
     try:
         r = get(f"{API_TASKS}/tasks", timeout=20)
@@ -106,7 +105,7 @@ for t in tasks:
     task_options.append(label)
     task_map[label] = tid_str
 
-# Layout: left column = templates & task create, right = file manager / editor / diff
+# Layout: left column = templates & task create & history, right = file manager / editor / diff
 col_left, col_right = st.columns([1, 2])
 
 with col_left:
@@ -115,7 +114,7 @@ with col_left:
     tpl_choice = st.selectbox("Choose a template", options=template_options, index=0)
     selected_tpl_id = template_map.get(tpl_choice)
 
-    # form fields (kept in session state so templates can populate)
+    # Initialize session fields if missing
     if "prompt_field" not in st.session_state:
         st.session_state["prompt_field"] = "Fix failing tests in module X"
     if "owner_field" not in st.session_state:
@@ -208,7 +207,6 @@ with col_left:
 
     st.markdown("---")
     st.header("Task History")
-    # refresh tasks
     tasks = fetch_tasks()
     if tasks:
         labels = []
@@ -222,6 +220,18 @@ with col_left:
         choice = st.selectbox("Select task", options=list(range(len(tasks))), format_func=lambda i: labels[i])
         selected_task = tasks[choice]
         st.markdown(f"**Selected task:** {labels[choice]}")
+        if st.button("Refresh task details"):
+            st.experimental_rerun()
+        # show recent steps
+        task_id_for_view = selected_task.get("_id")
+        if isinstance(task_id_for_view, dict) and "$oid" in task_id_for_view:
+            task_id_for_view = task_id_for_view["$oid"]
+        task_detail = get(f"{API_TASKS}/{task_id_for_view}", timeout=20).json().get("task", {})
+        st.markdown(f"Status: **{task_detail.get('status')}**")
+        st.markdown("### Steps")
+        for s in task_detail.get("steps", []):
+            st.markdown(f"**{s.get('name')}** — {s.get('timestamp')}")
+            st.code(s.get("output") or "(no output)", language="text")
     else:
         st.info("No tasks yet. Create one with the form above.")
         selected_task = None
