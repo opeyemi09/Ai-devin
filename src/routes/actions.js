@@ -144,6 +144,7 @@ router.post("/approve", async (req, res) => {
     const branch = task.branch;
     if (!branch) return res.status(400).json({ success: false, error: "task branch not found; commit changes first" });
 
+    // Determine owner/repo
     const meta = task.meta || {};
     const repoUrl = meta.repoUrl || null;
     if (!meta.owner || !meta.repo) {
@@ -158,13 +159,16 @@ router.post("/approve", async (req, res) => {
       return res.status(400).json({ success: false, error: "task.meta.owner and task.meta.repo required to push and create PR" });
     }
 
+    // run gitleaks before push
     const ghToken = process.env.GH_PAT;
     if (!ghToken) {
       return res.status(500).json({ success: false, error: "Server GH_PAT not configured; cannot push" });
     }
 
+    // tokenized remote (used for push)
     const remoteUrl = `https://${encodeURIComponent(ghToken)}@github.com/${finalOwner}/${finalRepo}.git`;
 
+    // ensure remote
     try {
       await runGit(["remote", "remove", "origin"], workspace).catch(() => {});
       await runGit(["remote", "add", "origin", remoteUrl], workspace);
@@ -172,6 +176,7 @@ router.post("/approve", async (req, res) => {
       log("warning: remote setup error", e.message || e);
     }
 
+    // run gitleaks to double-check
     try {
       const findings = await scanPath(workspace).catch(() => []);
       if (findings && findings.length && !overrideSecrets) {
@@ -179,8 +184,10 @@ router.post("/approve", async (req, res) => {
       }
     } catch (e) {
       log("gitleaks pre-push failed", e);
+      // proceed cautiously; do not block push solely because gitleaks failed to run
     }
 
+    // push branch
     try {
       await runGit(["push", "-u", "origin", branch], workspace);
     } catch (e) {
@@ -188,6 +195,7 @@ router.post("/approve", async (req, res) => {
       return res.status(500).json({ success: false, error: "git push failed: " + (e.message || String(e)) });
     }
 
+    // create PR via Octokit
     try {
       const prTitle = title || (task.commitMessage || `AI Devin: changes from task ${taskId}`);
       const prBodyFinal = prBody || `This PR was created by AI Devin for task ${taskId}`;
@@ -206,6 +214,8 @@ router.post("/approve", async (req, res) => {
 
 /**
  * POST /api/actions/undo
+ * Body: { taskId, base? }
+ * Creates a backup branch, then resets the task branch to base and cleans untracked files.
  */
 router.post("/undo", async (req, res) => {
   try {
@@ -247,6 +257,7 @@ router.post("/undo", async (req, res) => {
 
 /**
  * POST /api/actions/start-auto
+ * Body: { taskId, maxModulesPerRun?, dryRun?, testCommand?, sandboxImage?, gitleaksEnabled?, failOnSecrets?, runLint?, lintCommand?, failOnLint?, invokedBy? }
  */
 router.post("/start-auto", async (req, res) => {
   try {
@@ -265,6 +276,21 @@ router.post("/start-auto", async (req, res) => {
       failOnLint: !!req.body.failOnLint
     };
 
+    // Audit insert for start-auto
+    try {
+      const invoker = req.body.invokedBy || req.headers["x-api-user"] || "api";
+      await mongo.insertAudit({
+        taskId,
+        type: "auto",
+        action: "start",
+        actor: invoker,
+        details: { opts },
+        timestamp: new Date()
+      });
+    } catch (auditErr) {
+      log("start-auto audit failed", auditErr);
+    }
+
     const result = await startAuto(taskId, opts);
     return res.json(result);
   } catch (e) {
@@ -275,11 +301,28 @@ router.post("/start-auto", async (req, res) => {
 
 /**
  * POST /api/actions/stop-auto
+ * Body: { taskId, invokedBy? }
  */
 router.post("/stop-auto", async (req, res) => {
   try {
     const { taskId } = req.body || {};
     if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+
+    // Audit insert for stop-auto
+    try {
+      const invoker = req.body.invokedBy || req.headers["x-api-user"] || "api";
+      await mongo.insertAudit({
+        taskId,
+        type: "auto",
+        action: "stop",
+        actor: invoker,
+        details: {},
+        timestamp: new Date()
+      });
+    } catch (auditErr) {
+      log("stop-auto audit failed", auditErr);
+    }
+
     const result = await stopAuto(taskId);
     return res.json(result);
   } catch (e) {
@@ -309,18 +352,33 @@ router.post("/resume-auto", async (req, res) => {
       failOnLint: !!req.body.failOnLint
     };
 
-    // Audit log entry: record who invoked resume and which modules
+    // Structured audit log entry
     try {
       const invoker = req.body.invokedBy || req.headers["x-api-user"] || "api";
+      await mongo.insertAudit({
+        taskId,
+        type: "auto",
+        action: "resume",
+        actor: invoker,
+        details: { moduleIndices: opts.moduleIndices || null, opts },
+        timestamp: new Date()
+      });
+    } catch (auditErr) {
+      log("resume-auto audit failed", auditErr);
+    }
+
+    // Also append an append-only task step for human-readable trace (backwards compatibility)
+    try {
+      const invokerStep = req.body.invokedBy || req.headers["x-api-user"] || "api";
       await mongo.pushTaskStep(taskId, {
         name: "resume-invoked",
         timestamp: new Date(),
         success: true,
-        output: `Resume requested by ${invoker}`,
+        output: `Resume requested by ${invokerStep}`,
         metadata: { moduleIndices: opts.moduleIndices || null }
       });
-    } catch (auditErr) {
-      log("Failed to write resume audit entry", auditErr);
+    } catch (auditStepErr) {
+      log("Failed to write resume-invoked step", auditStepErr);
     }
 
     const result = await resumeAuto(taskId, opts);
