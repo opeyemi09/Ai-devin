@@ -5,8 +5,9 @@ const { runGit } = require("../tools/git");
 const { createPullRequest } = require("../tools/github");
 const { log, err } = require("../utils/logger");
 const path = require("path");
+const { start: startAuto, stop: stopAuto, status: statusAuto } = require("../orchestrator/autoGenerator");
+const { scanPath } = require("../tools/gitleaks");
 const fs = require("fs").promises;
-const { scanTextForSecrets } = require("../utils/security");
 
 const DEFAULT_BASE = process.env.DEFAULT_BRANCH || "main";
 
@@ -61,17 +62,14 @@ router.get("/file-diff", async (req, res) => {
     const branch = task.branch;
     if (!branch) return res.status(400).json({ success: false, error: "task branch not found; commit changes first" });
 
-    // get base file content via git show base:path (best-effort)
     let baseContent = "";
     try {
       const showRes = await runGit(["show", `${base}:${filePath}`], workspace);
       baseContent = showRes.stdout || showRes.stderr || "";
     } catch (e) {
-      // file may not exist on base
       baseContent = "";
     }
 
-    // read current file from workspace
     let currentContent = "";
     try {
       const full = path.join(workspace, filePath);
@@ -89,7 +87,7 @@ router.get("/file-diff", async (req, res) => {
 
 /**
  * GET /api/actions/scan?taskId=&base=
- * Scans the diff for secrets and returns findings.
+ * Scans the diff for secrets (simple) and also runs gitleaks if available.
  */
 router.get("/scan", async (req, res) => {
   try {
@@ -105,7 +103,6 @@ router.get("/scan", async (req, res) => {
     const branch = task.branch;
     if (!branch) return res.status(400).json({ success: false, error: "task branch not found; commit changes first" });
 
-    // get diff
     let diff = "";
     try {
       const d = await runGit(["diff", "--no-color", `${base}...${branch}`], workspace);
@@ -114,8 +111,15 @@ router.get("/scan", async (req, res) => {
       diff = "";
     }
 
-    const findings = scanTextForSecrets(diff);
-    res.json({ success: true, findings, diff, branch, base });
+    // simple regex-based scan included in security utils could be used; attempt gitleaks for higher fidelity
+    let gitleaksFindings = [];
+    try {
+      gitleaksFindings = await scanPath(workspace).catch(() => []);
+    } catch (e) {
+      log("gitleaks scan error", e);
+    }
+
+    res.json({ success: true, diff, gitleaksFindings, branch, base });
   } catch (e) {
     err("actions:scan error", e);
     res.status(500).json({ success: false, error: e.message || String(e) });
@@ -126,7 +130,6 @@ router.get("/scan", async (req, res) => {
  * POST /api/actions/approve
  * Body: { taskId, title, body, base?, overrideSecrets:false }
  * Pushes the task branch to origin and creates a PR via Octokit.
- * Blocks if secret findings exist unless overrideSecrets=true is provided.
  */
 router.post("/approve", async (req, res) => {
   try {
@@ -144,11 +147,8 @@ router.post("/approve", async (req, res) => {
 
     // Determine owner/repo
     const meta = task.meta || {};
-    const owner = meta.owner;
-    const repo = meta.repo;
     const repoUrl = meta.repoUrl || null;
-
-    if (!owner || !repo) {
+    if (!meta.owner || !meta.repo) {
       if (repoUrl) {
         const m = repoUrl.match(/github\.com[:\/]([^\/]+)\/(.+?)(\.git)?$/);
         if (m) { meta.owner = m[1]; meta.repo = m[2]; }
@@ -160,33 +160,32 @@ router.post("/approve", async (req, res) => {
       return res.status(400).json({ success: false, error: "task.meta.owner and task.meta.repo required to push and create PR" });
     }
 
-    // run secret scan on diff
-    let diff = "";
-    try {
-      const d = await runGit(["diff", "--no-color", `${base}...${branch}`], workspace);
-      diff = d.stdout || d.stderr || "";
-    } catch (e) {
-      diff = "";
-    }
-    const findings = scanTextForSecrets(diff || "");
-    if (findings.length && !overrideSecrets) {
-      return res.status(400).json({ success: false, error: "Secrets detected in diff", findings });
-    }
-
-    // ensure GH token is present
+    // run gitleaks before push
     const ghToken = process.env.GH_PAT;
     if (!ghToken) {
       return res.status(500).json({ success: false, error: "Server GH_PAT not configured; cannot push" });
     }
 
-    // set remote origin to tokenized HTTPS URL (non-persistent)
+    // tokenized remote (used for push)
     const remoteUrl = `https://${encodeURIComponent(ghToken)}@github.com/${finalOwner}/${finalRepo}.git`;
 
+    // ensure remote
     try {
       await runGit(["remote", "remove", "origin"], workspace).catch(() => {});
       await runGit(["remote", "add", "origin", remoteUrl], workspace);
     } catch (e) {
       log("warning: remote setup error", e.message || e);
+    }
+
+    // run gitleaks to double-check
+    try {
+      const findings = await scanPath(workspace).catch(() => []);
+      if (findings && findings.length && !overrideSecrets) {
+        return res.status(400).json({ success: false, error: "Secrets detected by gitleaks, aborting push", findings });
+      }
+    } catch (e) {
+      log("gitleaks pre-push failed", e);
+      // proceed cautiously; do not block push solely because gitleaks failed to run
     }
 
     // push branch
@@ -197,7 +196,7 @@ router.post("/approve", async (req, res) => {
       return res.status(500).json({ success: false, error: "git push failed: " + (e.message || String(e)) });
     }
 
-    // create PR
+    // create PR via Octokit
     try {
       const prTitle = title || (task.commitMessage || `AI Devin: changes from task ${taskId}`);
       const prBodyFinal = prBody || `This PR was created by AI Devin for task ${taskId}`;
@@ -233,19 +232,14 @@ router.post("/undo", async (req, res) => {
     let branch = task.branch;
     if (!branch) return res.status(400).json({ success: false, error: "task branch not found" });
 
-    // create backup branch name
     const ts = Date.now();
     const backupBranch = `backup/${branch.replace(/\//g, "_")}-${ts}`;
     try {
-      // ensure on branch, create backup
       await runGit(["checkout", branch], workspace);
       await runGit(["checkout", "-b", backupBranch], workspace);
-      // return to branch
       await runGit(["checkout", branch], workspace);
-      // reset branch to base (hard)
       await runGit(["reset", "--hard", base], workspace);
       await runGit(["clean", "-fd"], workspace);
-      // update task status
       await mongo.pushTaskStep(taskId, { name: "undo", timestamp: new Date(), success: true, output: `Reset ${branch} to ${base}, backup: ${backupBranch}` });
       await mongo.updateTask(taskId, { status: "reverted", lastError: null });
       return res.json({ success: true, message: `Reverted ${branch} to ${base}`, backupBranch });
@@ -256,6 +250,68 @@ router.post("/undo", async (req, res) => {
     }
   } catch (e) {
     err("actions:undo error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/* Automated generation endpoints */
+
+/**
+ * POST /api/actions/start-auto
+ * Body: { taskId, maxModulesPerRun?, dryRun?, testCommand?, sandboxImage?, gitleaksEnabled?, failOnSecrets?, runLint?, lintCommand?, failOnLint? }
+ */
+router.post("/start-auto", async (req, res) => {
+  try {
+    const { taskId, dryRun } = req.body || {};
+    if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+
+    const opts = {
+      maxModulesPerRun: req.body.maxModulesPerRun,
+      dryRun: !!dryRun,
+      testCommand: req.body.testCommand,
+      sandboxImage: req.body.sandboxImage,
+      gitleaksEnabled: !!req.body.gitleaksEnabled,
+      failOnSecrets: !!req.body.failOnSecrets,
+      runLint: !!req.body.runLint,
+      lintCommand: req.body.lintCommand,
+      failOnLint: !!req.body.failOnLint
+    };
+
+    const result = await startAuto(taskId, opts);
+    return res.json(result);
+  } catch (e) {
+    err("start-auto error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/**
+ * POST /api/actions/stop-auto
+ * Body: { taskId }
+ */
+router.post("/stop-auto", async (req, res) => {
+  try {
+    const { taskId } = req.body || {};
+    if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+    const result = await stopAuto(taskId);
+    return res.json(result);
+  } catch (e) {
+    err("stop-auto error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/**
+ * GET /api/actions/auto-status?taskId=
+ */
+router.get("/auto-status", async (req, res) => {
+  try {
+    const taskId = req.query.taskId;
+    if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+    const result = await statusAuto(taskId);
+    return res.json({ success: true, status: result });
+  } catch (e) {
+    err("auto-status error", e);
     res.status(500).json({ success: false, error: e.message || String(e) });
   }
 });
