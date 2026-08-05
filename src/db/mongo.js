@@ -96,6 +96,34 @@ async function deleteTemplate(id) {
   return res.deletedCount === 1;
 }
 
+/* Module plan helpers (new) */
+
+/**
+ * setModulePlan(taskId, plan)
+ * plan: array of { name, path, description, targetLines, tests: { path or pattern }, extras... }
+ */
+async function setModulePlan(taskId, plan) {
+  const col = tasksCollection();
+  const _id = typeof taskId === "string" ? new ObjectId(taskId) : taskId;
+  const statuses = (plan || []).map((m) => ({ name: m.name, status: "pending", updatedAt: new Date(0), info: null }));
+  const res = await col.findOneAndUpdate({ _id }, { $set: { modulePlan: plan, moduleStatuses: statuses } }, { returnDocument: "after" });
+  return res.value;
+}
+
+async function getModulePlan(taskId) {
+  const task = await findTaskById(taskId);
+  return { plan: task && task.modulePlan, statuses: task && task.moduleStatuses };
+}
+
+async function updateModuleStatus(taskId, moduleIndex, update) {
+  const col = tasksCollection();
+  const _id = typeof taskId === "string" ? new ObjectId(taskId) : taskId;
+  const key = `moduleStatuses.${moduleIndex}`;
+  update.updatedAt = new Date();
+  const res = await col.findOneAndUpdate({ _id }, { $set: { [key]: update } }, { returnDocument: "after" });
+  return res.value;
+}
+
 module.exports = {
   connect,
   getDb,
@@ -109,5 +137,8 @@ module.exports = {
   findTemplateById,
   updateTemplate,
   deleteTemplate,
+  setModulePlan,
+  getModulePlan,
+  updateModuleStatus,
   ObjectId
 };
