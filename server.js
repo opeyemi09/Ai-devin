@@ -1,9 +1,10 @@
-// server.js
 require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const fs = require("fs").promises;
 const path = require("path");
+const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
 const { taskQueue } = require("./src/queue/queue");
 const { log, err } = require("./src/utils/logger");
 const mongo = require("./src/db/mongo");
@@ -11,14 +12,36 @@ const filesRouter = require("./src/routes/files");
 const actionsRouter = require("./src/routes/actions");
 
 const app = express();
+app.use(helmet());
 app.use(bodyParser.json());
 
-// mount file manager endpoints under /api
-app.use("/api", filesRouter);
-// mount actions endpoints under /api/actions
-app.use("/api/actions", actionsRouter);
+// simple API key auth middleware
+const API_KEY = process.env.API_KEY || null;
+function apiKeyMiddleware(req, res, next) {
+  if (!API_KEY) return next(); // if not set, do not enforce
+  const key = req.headers["x-api-key"] || req.query.api_key || req.headers["authorization"];
+  if (!key) return res.status(401).json({ success: false, error: "API key required" });
+  // accept "Bearer <key>" or raw key
+  const normalized = (key || "").toString().replace(/^Bearer\s+/i, "");
+  if (normalized !== API_KEY) return res.status(403).json({ success: false, error: "invalid API key" });
+  next();
+}
 
-const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/ai_devin";
+// global rate limiter for API routes
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 200, // limit each IP to 200 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: "Too many requests, slow down" }
+});
+
+// apply auth + limiter to /api
+app.use("/api", apiKeyMiddleware, limiter, filesRouter);
+// apply auth + limiter to actions explicitly
+app.use("/api/actions", apiKeyMiddleware, limiter, actionsRouter);
+
+// non-API endpoints still available (e.g., /run, /tasks)
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "./workspace");
 
 async function ensureDir(p) {
@@ -26,6 +49,7 @@ async function ensureDir(p) {
 }
 
 async function start() {
+  const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/ai_devin";
   await mongo.connect(MONGO_URL);
 
   // ensure workspace root exists
@@ -37,7 +61,6 @@ async function start() {
   app.post("/run", async (req, res) => {
     const body = req.body || {};
     try {
-      // Insert task into Mongo
       const taskDoc = {
         prompt: body.prompt || "",
         createdBy: body.createdBy || "local",
@@ -55,16 +78,14 @@ async function start() {
       const taskWorkspace = path.join(WORKSPACE_ROOT, "tasks", taskId);
       await ensureDir(taskWorkspace);
 
-      // If a repo URL was provided, try to git clone into the workspace; otherwise init git
+      // If repo URL provided, clone; else init git
       const repoUrl = (body.meta && body.meta.repoUrl) || body.repoUrl || null;
       const { runGit } = require("./src/tools/git");
       try {
         if (repoUrl) {
-          // clone into the workspace path
           await runGit(["clone", repoUrl, taskWorkspace], process.cwd());
           log("Cloned repo into", taskWorkspace);
         } else {
-          // initialize empty git repo
           await runGit(["init"], taskWorkspace);
           log("Initialized empty git repo in", taskWorkspace);
         }
