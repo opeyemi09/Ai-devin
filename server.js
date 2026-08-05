@@ -1,4 +1,5 @@
 require("dotenv").config();
+const filesRouter = require("./src/routes/files");
 const express = require("express");
 const bodyParser = require("body-parser");
 const { taskQueue } = require("./src/queue/queue");
@@ -7,6 +8,8 @@ const mongo = require("./src/db/mongo");
 
 const app = express();
 app.use(bodyParser.json());
+app.use("/api", filesRouter);
+
 
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/ai_devin";
 
