@@ -1,4 +1,3 @@
-// src/routes/actions.js
 const express = require("express");
 const router = express.Router();
 const mongo = require("../db/mongo");
@@ -291,7 +290,7 @@ router.post("/stop-auto", async (req, res) => {
 
 /**
  * POST /api/actions/resume-auto
- * Body: { taskId, moduleIndices?: [int], maxModulesPerRun?, gitleaksEnabled?, runLint?, failOnSecrets?, lintCommand?, failOnLint? }
+ * Body: { taskId, moduleIndices?: [int], maxModulesPerRun?, gitleaksEnabled?, runLint?, failOnSecrets?, lintCommand?, failOnLint?, invokedBy? }
  */
 router.post("/resume-auto", async (req, res) => {
   try {
@@ -309,6 +308,20 @@ router.post("/resume-auto", async (req, res) => {
       lintCommand: req.body.lintCommand,
       failOnLint: !!req.body.failOnLint
     };
+
+    // Audit log entry: record who invoked resume and which modules
+    try {
+      const invoker = req.body.invokedBy || req.headers["x-api-user"] || "api";
+      await mongo.pushTaskStep(taskId, {
+        name: "resume-invoked",
+        timestamp: new Date(),
+        success: true,
+        output: `Resume requested by ${invoker}`,
+        metadata: { moduleIndices: opts.moduleIndices || null }
+      });
+    } catch (auditErr) {
+      log("Failed to write resume audit entry", auditErr);
+    }
 
     const result = await resumeAuto(taskId, opts);
     return res.json(result);
