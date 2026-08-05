@@ -1,3 +1,4 @@
+// src/routes/actions.js
 const express = require("express");
 const router = express.Router();
 const mongo = require("../db/mongo");
@@ -5,7 +6,7 @@ const { runGit } = require("../tools/git");
 const { createPullRequest } = require("../tools/github");
 const { log, err } = require("../utils/logger");
 const path = require("path");
-const { start: startAuto, stop: stopAuto, status: statusAuto } = require("../orchestrator/autoGenerator");
+const { start: startAuto, stop: stopAuto, status: statusAuto, resume: resumeAuto } = require("../orchestrator/autoGenerator");
 const { scanPath } = require("../tools/gitleaks");
 const fs = require("fs").promises;
 
@@ -111,7 +112,6 @@ router.get("/scan", async (req, res) => {
       diff = "";
     }
 
-    // simple regex-based scan included in security utils could be used; attempt gitleaks for higher fidelity
     let gitleaksFindings = [];
     try {
       gitleaksFindings = await scanPath(workspace).catch(() => []);
@@ -145,7 +145,6 @@ router.post("/approve", async (req, res) => {
     const branch = task.branch;
     if (!branch) return res.status(400).json({ success: false, error: "task branch not found; commit changes first" });
 
-    // Determine owner/repo
     const meta = task.meta || {};
     const repoUrl = meta.repoUrl || null;
     if (!meta.owner || !meta.repo) {
@@ -160,16 +159,13 @@ router.post("/approve", async (req, res) => {
       return res.status(400).json({ success: false, error: "task.meta.owner and task.meta.repo required to push and create PR" });
     }
 
-    // run gitleaks before push
     const ghToken = process.env.GH_PAT;
     if (!ghToken) {
       return res.status(500).json({ success: false, error: "Server GH_PAT not configured; cannot push" });
     }
 
-    // tokenized remote (used for push)
     const remoteUrl = `https://${encodeURIComponent(ghToken)}@github.com/${finalOwner}/${finalRepo}.git`;
 
-    // ensure remote
     try {
       await runGit(["remote", "remove", "origin"], workspace).catch(() => {});
       await runGit(["remote", "add", "origin", remoteUrl], workspace);
@@ -177,7 +173,6 @@ router.post("/approve", async (req, res) => {
       log("warning: remote setup error", e.message || e);
     }
 
-    // run gitleaks to double-check
     try {
       const findings = await scanPath(workspace).catch(() => []);
       if (findings && findings.length && !overrideSecrets) {
@@ -185,10 +180,8 @@ router.post("/approve", async (req, res) => {
       }
     } catch (e) {
       log("gitleaks pre-push failed", e);
-      // proceed cautiously; do not block push solely because gitleaks failed to run
     }
 
-    // push branch
     try {
       await runGit(["push", "-u", "origin", branch], workspace);
     } catch (e) {
@@ -196,7 +189,6 @@ router.post("/approve", async (req, res) => {
       return res.status(500).json({ success: false, error: "git push failed: " + (e.message || String(e)) });
     }
 
-    // create PR via Octokit
     try {
       const prTitle = title || (task.commitMessage || `AI Devin: changes from task ${taskId}`);
       const prBodyFinal = prBody || `This PR was created by AI Devin for task ${taskId}`;
@@ -215,8 +207,6 @@ router.post("/approve", async (req, res) => {
 
 /**
  * POST /api/actions/undo
- * Body: { taskId, base? }
- * Creates a backup branch, then resets the task branch to base and cleans untracked files.
  */
 router.post("/undo", async (req, res) => {
   try {
@@ -258,7 +248,6 @@ router.post("/undo", async (req, res) => {
 
 /**
  * POST /api/actions/start-auto
- * Body: { taskId, maxModulesPerRun?, dryRun?, testCommand?, sandboxImage?, gitleaksEnabled?, failOnSecrets?, runLint?, lintCommand?, failOnLint? }
  */
 router.post("/start-auto", async (req, res) => {
   try {
@@ -287,7 +276,6 @@ router.post("/start-auto", async (req, res) => {
 
 /**
  * POST /api/actions/stop-auto
- * Body: { taskId }
  */
 router.post("/stop-auto", async (req, res) => {
   try {
@@ -297,6 +285,35 @@ router.post("/stop-auto", async (req, res) => {
     return res.json(result);
   } catch (e) {
     err("stop-auto error", e);
+    res.status(500).json({ success: false, error: e.message || String(e) });
+  }
+});
+
+/**
+ * POST /api/actions/resume-auto
+ * Body: { taskId, moduleIndices?: [int], maxModulesPerRun?, gitleaksEnabled?, runLint?, failOnSecrets?, lintCommand?, failOnLint? }
+ */
+router.post("/resume-auto", async (req, res) => {
+  try {
+    const { taskId } = req.body || {};
+    if (!taskId) return res.status(400).json({ success: false, error: "taskId required" });
+
+    const opts = {
+      moduleIndices: Array.isArray(req.body.moduleIndices) ? req.body.moduleIndices.map(Number) : undefined,
+      maxModulesPerRun: req.body.maxModulesPerRun,
+      testCommand: req.body.testCommand,
+      sandboxImage: req.body.sandboxImage,
+      gitleaksEnabled: !!req.body.gitleaksEnabled,
+      failOnSecrets: !!req.body.failOnSecrets,
+      runLint: !!req.body.runLint,
+      lintCommand: req.body.lintCommand,
+      failOnLint: !!req.body.failOnLint
+    };
+
+    const result = await resumeAuto(taskId, opts);
+    return res.json(result);
+  } catch (e) {
+    err("resume-auto error", e);
     res.status(500).json({ success: false, error: e.message || String(e) });
   }
 });
